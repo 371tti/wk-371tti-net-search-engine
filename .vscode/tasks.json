@@ -1,0 +1,148 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "cargo check",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (large tokenize)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (large tokenize)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check crawler integration",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (fix)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (fix2)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (enable bincode serde)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (serde + ctrlc loop)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (tfidf json)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		},
+		{
+			"label": "cargo check (TFIDFData via bincode)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
+		}
+	]
+}
