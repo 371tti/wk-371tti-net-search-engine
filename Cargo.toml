@@ -5,18 +5,23 @@ edition = "2024"
 
 [dependencies]
 chrono = { version = "0.4.42", features = ["serde"] }
-dashmap = "6.1.0"
 kurosabi = "0.4.7"
-tf-idf-vectorizer = "0.4.11"
+tf-idf-vectorizer = "0.5.0"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "time", "io-util", "io-std", "signal"] }
 reqwest = { version = "0.12.8", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 url = "2.5"
+log = "0.4.28"
+dashmap = "6.1.0"
+
 thiserror = "1.0"
 futures = "0.3"
 percent-encoding = "2.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rustyline = "13"
-bincode = { version = "2.0.1", features = ["serde"] }
+rayon = "1.11.0"
+bincode = "1.3.3"
+
+
+
+

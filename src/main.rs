@@ -1,9 +1,8 @@
-mod collect;
+mod tokenize;
 mod http_client;
+mod index;
+mod collect;
 
-use std::f32::consts::E;
-
-use dashmap::DashMap;
 use kurosabi::Kurosabi;
 use serde_json::json;
 use tf_idf_vectorizer::{SimilarityAlgorithm, TokenFrequency};
