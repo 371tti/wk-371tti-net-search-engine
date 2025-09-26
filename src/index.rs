@@ -1,30 +1,40 @@
 use std::collections::HashMap;
+use std::io::Error;
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
-use std::hash::Hash;
 
-use log::warn;
-use rayon::{prelude::*, result};
+use log::{error, warn};
+use rayon::prelude::*;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use tf_idf_vectorizer::{Corpus, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
 use serde::{Serialize, Deserialize};
 
-use crate::collect::{ResEntry, ScoredEntry, SortEntry};
-
-use super::collect::SimilarityResult;
+use crate::collect::{ResEntry, ScoredEntry};
 
 
 pub struct IndexPool {
     pub corpus: Arc<Corpus>,
-    pub indexes: DashMap<usize, Arc<RwLock<Index>>>,
+    /// Index shards
+    /// idと対応を絶対強制
+    pub indexes: Vec<Arc<RwLock<Index>>>,
 }
+
+pub const DEFAULT_INDEX_SHARD_NUM: usize = 16;
+pub const MAX_FILE_SIZE: usize = 200 * 1024 * 1024; // 200MB
+pub const CALCULATE_BIN_SIZE_INTERVAL: usize = 20; // 20回更新ごとにバイナリサイズを再計算
+pub const SAVE_FILE_INTERVAL: usize = 100; // 100回更新ごとにディスクに保存
+pub const SAVE_FILE_DIR: &str = "./data";
 
 impl IndexPool {
     pub fn new() -> Self {
+        let corpus = Arc::new(Corpus::new());
+        // Create index shards
+        let indexes: Vec<Arc<RwLock<Index>>> = (0..DEFAULT_INDEX_SHARD_NUM).map(|i| {
+            Arc::new(RwLock::new(Index::new(i, Arc::clone(&corpus))))
+        }).collect();
         Self {
-            corpus: Arc::new(Corpus::new()),
-            indexes: DashMap::new(),
+            corpus,
+            indexes
         }
     }
 
@@ -47,10 +57,7 @@ impl IndexPool {
     /// }
     /// ```
     pub fn per_similarity(&self, token_fq: &TokenFrequency, algorithm: &SimilarityAlgorithm) -> Vec<ScoredEntry> {
-        let arcs: Vec<Arc<RwLock<Index>>> = self.indexes
-            .iter().map(|e| Arc::clone(e.value())).collect();
-
-        let result: Vec<ScoredEntry> = arcs
+        let result: Vec<ScoredEntry> = self.indexes
             .iter().filter_map(|e| e.try_read().ok())
             .collect::<Vec<_>>()
             .par_iter().flat_map(|idx| {
@@ -84,8 +91,8 @@ impl IndexPool {
         let mut res_entries = Vec::new();
         let range_results = &results[range];
         for scored in range_results {
-            let index = match self.indexes.get(&scored.index_id) {
-                Some(idx) => Arc::clone(idx.value()),
+            let index = match self.indexes.get(scored.index_id) {
+                Some(idx) => idx,
                 None => continue,
             };
             let index_read = match index.read() {
@@ -95,7 +102,7 @@ impl IndexPool {
                     continue; // Skip poisoned lock
                 }
             };
-            let meta = match index_read.meta.get(scored.key) {
+            let meta = match index_read.meta_from_id(scored.key) {
                 Some(m) => m,
                 None => continue,
             };
@@ -121,6 +128,110 @@ impl IndexPool {
         res_entries
     }
 
+    /// add document to index pool
+    /// meta.id は上書きされます
+    /// # Arguments
+    /// * `token_fq` - TokenFrequency of the document
+    /// * `meta` - Metadata of the document
+    /// # Returns
+    /// Some(bool) true is new, false is update, None if failed
+    /// CALCULATE_BIN_SIZE_INTERVAL ごとにバイナリサイズを再計算し、SAVE_FILE_INTERVAL ごとにディスクに保存します
+    /// もっとも負荷の低いシャードに追加されます
+    /// 既存のURLがあれば上書きされます
+    pub fn add_document(&self,
+        token_fq: &TokenFrequency,
+        mut meta: IndexMeta,
+    ) -> Option<bool> {
+        let url = meta.url.clone();
+        let mut is_new = true;
+        let mut shard_id = 0;
+        let mut doc_id = 0;
+        // 既存で登録されているかチェック
+        let mut max_size = 0;
+        for index in &self.indexes {
+            match index.read() {
+                Ok(idx) => {
+                    if is_new {
+                        if let Some(meta) = idx.meta_from_url(&url) {
+                            // 既に登録されている
+                            shard_id = idx.id;
+                            doc_id = meta.id;
+                        is_new = false;
+                        break;
+                        }
+                    }
+                    // 見つからない場合もっとも負荷の低いシャードを選んでく
+                    let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
+                    if max_size >= size {
+                        shard_id = idx.id;
+                        max_size = max_size;
+                    }
+                }
+                Err(_poison) => {
+                    warn!("RwLock poisoned, skipping");
+                    continue; // Skip poisoned lock
+                }
+            }
+        }
+        let mut do_save = false;
+        let mut do_calculate_size = false;
+        if is_new {
+            // 新規登録
+            if let Ok(mut idx) = self.indexes[shard_id].write() {
+                doc_id = idx.generate_next_id();
+                idx.vectorizer.add_doc(doc_id, token_fq);
+                meta.id = doc_id;
+                idx.meta.push(meta);
+                do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
+                do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
+                idx.update_count += 1;
+            } else {
+                error!("RwLock poisoned for index id {}, skipping", shard_id);
+                return None;
+            }
+        } else {
+            // 既存を削除してから再登録
+            if let Ok(mut idx) = self.indexes[shard_id].write() {
+                idx.vectorizer.del_doc(&doc_id);
+                idx.vectorizer.add_doc(doc_id, token_fq);
+                idx.meta_from_id_mut(doc_id).map(|m| {
+                    m.url = meta.url.clone();
+                    m.title = meta.title.clone();
+                    m.favicon = meta.favicon.clone();
+                    m.tags = meta.tags.clone();
+                    m.description = meta.description.clone();
+                    m.points = meta.points;
+                    m.time = meta.time;
+                });
+                do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
+                do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
+                idx.update_count += 1;
+            } else {
+                error!("RwLock poisoned for index id {}, skipping", shard_id);
+                return None;
+            }
+        }
+
+        if do_save {
+            // Save the index to disk
+            if let Ok(bin_size) = self.save_shard(shard_id, SAVE_FILE_DIR) {
+                if let Ok(mut idx) = self.indexes[shard_id].write() {
+                    idx.vectorizer_bin_size = bin_size.0;
+                    idx.meta_bin_size = bin_size.1;
+                }
+            }
+        } else if do_calculate_size {
+            // Just calculate the binary size
+            if let Ok(bin_size) = self.calculate_shard_size(shard_id) {
+                if let Ok(mut idx) = self.indexes[shard_id].write() {
+                    idx.vectorizer_bin_size = bin_size.0;
+                    idx.meta_bin_size = bin_size.1;
+                }
+            }
+        }
+
+        Some(is_new)
+    }
 
     /// Load indexes and corpus from the specified directory
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -196,9 +307,7 @@ impl IndexPool {
             }
         };
 
-        let indexes = DashMap::new();
-
-        let vectorizer_map: HashMap<usize, TFIDFVectorizer<u16, usize>> = index_paths.iter()
+        let mut vectorizer_map: HashMap<usize, TFIDFVectorizer<u16, usize>> = index_paths.iter()
             .filter_map(|path| {
                 let id = path.file_stem()
                     .and_then(|s| s.to_str())
@@ -245,17 +354,20 @@ impl IndexPool {
             })
             .collect();
 
-        for (id, vectorizer) in vectorizer_map {
-            let meta = match meta_map.remove(&id) {
-                Some(m) => m,
-                None => {
-                    log::warn!("Meta file for index ID {} not found, skip loading", id);
-                    continue;
-                }
-            };
-            let index = Index::with_vectorizer(id, vectorizer, meta);
-            let index_rwlock_arc = Arc::new(RwLock::new(index));
-            indexes.insert(id, index_rwlock_arc);
+        let mut indexes = Vec::with_capacity(DEFAULT_INDEX_SHARD_NUM);
+
+        for i in (0..DEFAULT_INDEX_SHARD_NUM) {
+            let vectorizer = vectorizer_map.remove(&i).ok_or_else(|| {
+                log::error!("No vectorizer found for index id {}", i);
+                Box::new(Error::new(std::io::ErrorKind::NotFound, "Vectorizer not found"))
+            })?;
+            let vectorizer_bin_size = bincode::serialized_size(&vectorizer)?;
+            let meta = meta_map.remove(&i).ok_or_else(|| {
+                log::error!("No meta found for index id {}", i);
+                Box::new(Error::new(std::io::ErrorKind::NotFound, "Meta not found"))
+            })?;
+            let meta_bin_size = bincode::serialized_size(&meta)?;
+            indexes.push(Arc::new(RwLock::new(Index::with_vectorizer(i, vectorizer, meta, vectorizer_bin_size, meta_bin_size))));
         }
 
         Ok(Self { corpus, indexes })
@@ -272,10 +384,10 @@ impl IndexPool {
 
         // Save each index and meta
         for entry in self.indexes.iter() {
-            let index = entry.value().read().unwrap_or_else(|poison| {
-                warn!("RwLock poisoned for index id {}, recovering", entry.key());
-                poison.into_inner() // poison を無視して中身を取得
-            });
+            let index = entry.read().map_err(|e| {
+                log::error!("Failed to acquire read lock for index: {}", e);
+                Box::new(Error::new(std::io::ErrorKind::Other, "RwLock poisoned"))
+            })?;
             let index_path = std::path::Path::new(path).join(format!("{}.index", index.id));
             let meta_path = std::path::Path::new(path).join(format!("{}.meta", index.id));
 
@@ -288,9 +400,70 @@ impl IndexPool {
 
         Ok(())
     }
+
+    /// 指定したシャードのみ上書き保存
+    /// # Arguments
+    /// * `shard_id` - シャードID
+    /// * `path` - 保存先ディレクトリ
+    /// # Returns
+    /// Ok((u64, u64)) or Err
+    /// u64: vectorizer size, u64: meta size
+    pub fn save_shard(&self, shard_id: usize, path: &str) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(path)?;
+
+        // Save corpus
+        let corpus_path = std::path::Path::new(path).join("global.corpus");
+        let corpus_file = std::fs::File::create(&corpus_path)?;
+        let mut corpus_writer = std::io::BufWriter::new(corpus_file);
+        bincode::serialize_into(&mut corpus_writer, &*self.corpus)?;
+
+        // Save specified index and meta
+        if let Some(entry) = self.indexes.get(shard_id) {
+            let index = entry.read().map_err(|e| {
+                log::error!("Failed to acquire read lock for index: {}", e);
+                Box::new(Error::new(std::io::ErrorKind::Other, "RwLock poisoned"))
+            })?;
+
+            // Save vectorizer
+            let index_path = std::path::Path::new(path).join(format!("{}.index", index.id));
+            let index_file = std::fs::File::create(&index_path)?;
+            let mut index_writer = std::io::BufWriter::new(index_file);
+            bincode::serialize_into(&mut index_writer, &index.vectorizer)?;
+
+            // Save metadata
+            let meta_path = std::path::Path::new(path).join(format!("{}.meta", index.id));
+            let meta_file = std::fs::File::create(&meta_path)?;
+            let mut meta_writer = std::io::BufWriter::new(meta_file);
+            bincode::serialize_into(&mut meta_writer, &index.meta)?;
+
+            // Get file sizes
+            let vectorizer_bin_size = std::fs::metadata(&index_path)?.len();
+            let meta_bin_size = std::fs::metadata(&meta_path)?.len();
+
+            Ok((vectorizer_bin_size, meta_bin_size))
+        } else {
+            return Err(Box::new(Error::new(std::io::ErrorKind::NotFound, "Index shard not found")));
+        }
+    }
+
+    pub fn calculate_shard_size(&self, shard_id: usize) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+        // Just calculate the binary size of the specified shard
+        if let Some(entry) = self.indexes.get(shard_id) {
+            let index = entry.read().map_err(|e| {
+                log::error!("Failed to acquire read lock for index: {}", e);
+                Box::new(Error::new(std::io::ErrorKind::Other, "RwLock poisoned"))
+            })?;
+
+            let vectorizer_bin_size = bincode::serialized_size(&index.vectorizer)?;
+            let meta_bin_size = bincode::serialized_size(&index.meta)?;
+
+            Ok((vectorizer_bin_size, meta_bin_size))
+        } else {
+            return Err(Box::new(Error::new(std::io::ErrorKind::NotFound, "Index shard not found")));
+        }
+    }
 }
 
-pub const INDEX_VERSION: u32 = 1;
 
 pub struct Index {
     pub id: usize,
@@ -301,7 +474,9 @@ pub struct Index {
     /// Metadata for each document
     /// The index in this vector corresponds to the document ID in the vectorizer
     pub meta: Vec<IndexMeta>,
-    pub version: u32, // INDEX_VERSION
+    pub update_count: usize,
+    pub vectorizer_bin_size: u64,
+    pub meta_bin_size: u64,
 }
 
 impl Index {
@@ -310,17 +485,52 @@ impl Index {
             id,
             vectorizer: TFIDFVectorizer::<u16, usize>::new(corpus),
             meta: Vec::new(),
-            version: INDEX_VERSION,
+            update_count: 0,
+            vectorizer_bin_size: 0,
+            meta_bin_size: 0,
         }
     }
 
-    pub fn with_vectorizer(id: usize, vectorizer: TFIDFVectorizer<u16, usize>, meta: Vec<IndexMeta>) -> Self {
+    pub fn with_vectorizer(id: usize, vectorizer: TFIDFVectorizer<u16, usize>, meta: Vec<IndexMeta>, vectorizer_bin_size: u64, meta_bin_size: u64) -> Self {
         Self {
             id,
             vectorizer,
             meta,
-            version: INDEX_VERSION,
+            update_count: 0,
+            vectorizer_bin_size,
+            meta_bin_size,
         }
+    }
+
+    pub fn meta_from_url(&self, url: &str) -> Option<&IndexMeta> {
+        self.meta.iter().find(|m| m.url.as_ref() == url)
+    }
+
+    /// idからメタを取得
+    /// indexで取得してでなければiter rev で探索
+    pub fn meta_from_id(&self, id: usize) -> Option<&IndexMeta> {
+        if id > self.meta.len() {
+            return None;
+        }
+
+
+        // `id` 以降の要素は存在しないため、`id` の位置から逆方向に探索
+        let skip_count = self.meta.len().saturating_sub(id + 1);
+        self.meta.iter().rev().skip(skip_count).find(|m| m.id == id)
+    }
+
+    pub fn meta_from_id_mut(&mut self, id: usize) -> Option<&mut IndexMeta> {
+        if id > self.meta.len() {
+            return None;
+        }
+
+        // `id` 以降の要素は存在しないため、`id` の位置から逆方向に探索
+        let skip_count = self.meta.len().saturating_sub(id + 1);
+        self.meta.iter_mut().rev().skip(skip_count).find(|m| m.id == id)
+    }
+
+    pub fn generate_next_id(&self) -> usize {
+        self.meta.last().and_then(|m| Some(m.id + 1)).unwrap_or(0)
     }
 }
 
@@ -329,6 +539,7 @@ impl Index {
 /// Hash と Equal は URL のみで判定
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMeta {
+    pub id: usize,
     /// URL
     /// only URL is used for Hash and Equal
     pub url: Box<str>,

@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tf_idf_vectorizer::Hits;
 
 pub struct ScoredEntry {
     pub score: f64,
