@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::Error;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use log::{error, warn};
@@ -17,16 +18,17 @@ pub struct IndexPool {
     /// Index shards
     /// idと対応を絶対強制
     pub indexes: Vec<Arc<RwLock<Index>>>,
+    pub index_dir: String,
+    pub counter: AtomicU64,
 }
 
 pub const DEFAULT_INDEX_SHARD_NUM: usize = 16;
 pub const MAX_FILE_SIZE: usize = 200 * 1024 * 1024; // 200MB
 pub const CALCULATE_BIN_SIZE_INTERVAL: usize = 20; // 20回更新ごとにバイナリサイズを再計算
 pub const SAVE_FILE_INTERVAL: usize = 100; // 100回更新ごとにディスクに保存
-pub const SAVE_FILE_DIR: &str = "./data";
 
 impl IndexPool {
-    pub fn new() -> Self {
+    pub fn new(index_dir: &str) -> Self {
         let corpus = Arc::new(Corpus::new());
         // Create index shards
         let indexes: Vec<Arc<RwLock<Index>>> = (0..DEFAULT_INDEX_SHARD_NUM).map(|i| {
@@ -34,7 +36,9 @@ impl IndexPool {
         }).collect();
         Self {
             corpus,
-            indexes
+            indexes,
+            index_dir: index_dir.to_string(),
+            counter: AtomicU64::new(0),
         }
     }
 
@@ -87,9 +91,26 @@ impl IndexPool {
         results
     }
 
+    /// Generate ResEntry from ScoredEntry
+    /// # Arguments
+    /// * `results` - The scored entries to generate results from
+    /// * `range` - The range of results to include
+    /// * `tag` - The tag to filter results by
+    /// * `tag_exclusive` - Whether to use exclusive tag filtering
+    /// # Returns
+    /// Vector of ResEntry
     pub fn generate_results(&self, results: Vec<ScoredEntry>, range: Range<usize>, tag: Tags, tag_exclusive: bool) -> Vec<ResEntry> {
         let mut res_entries = Vec::new();
-        let range_results = &results[range];
+        let range_results: &[ScoredEntry] = {
+            let len = results.len();
+            let start = range.start.min(len);
+            let end = range.end.min(len);
+            if start >= end {
+            &[]
+            } else {
+            &results[start..end]
+            }
+        };
         for scored in range_results {
             let index = match self.indexes.get(scored.index_id) {
                 Some(idx) => idx,
@@ -108,8 +129,17 @@ impl IndexPool {
             };
             // タグフィルタリング
             // example: tag_exclusive = true -> 完全一致, false -> 部分一致
-            if (tag_exclusive && !meta.tags.is_filter_contains(tag)) || (!tag_exclusive && !meta.tags.contains(tag)) {
-                continue;
+            // タグ指定が空でなければフィルタ
+            if !tag.is_empty() {
+                if tag_exclusive {
+                    if !meta.tags.is_filter_contains(tag) {
+                        continue;
+                    }
+                } else {
+                    if !meta.tags.contains(tag) {
+                        continue;
+                    }
+                }
             }
             res_entries.push(ResEntry {
                 url: meta.url.clone(),
@@ -173,18 +203,20 @@ impl IndexPool {
                 }
             }
         }
-        let mut do_save = false;
-        let mut do_calculate_size = false;
+        let do_save;
+        let do_calculate_size ;
         if is_new {
             // 新規登録
             if let Ok(mut idx) = self.indexes[shard_id].write() {
                 doc_id = idx.generate_next_id();
                 idx.vectorizer.add_doc(doc_id, token_fq);
+                idx.vectorizer.update_idf();
                 meta.id = doc_id;
                 idx.meta.push(meta);
                 do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
                 do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
                 idx.update_count += 1;
+                self.counter.fetch_add(1, Ordering::SeqCst);
             } else {
                 error!("RwLock poisoned for index id {}, skipping", shard_id);
                 return None;
@@ -194,6 +226,7 @@ impl IndexPool {
             if let Ok(mut idx) = self.indexes[shard_id].write() {
                 idx.vectorizer.del_doc(&doc_id);
                 idx.vectorizer.add_doc(doc_id, token_fq);
+                idx.vectorizer.update_idf();
                 idx.meta_from_id_mut(doc_id).map(|m| {
                     m.url = meta.url.clone();
                     m.title = meta.title.clone();
@@ -214,7 +247,7 @@ impl IndexPool {
 
         if do_save {
             // Save the index to disk
-            if let Ok(bin_size) = self.save_shard(shard_id, SAVE_FILE_DIR) {
+            if let Ok(bin_size) = self.save_shard(shard_id, &self.index_dir) {
                 if let Ok(mut idx) = self.indexes[shard_id].write() {
                     idx.vectorizer_bin_size = bin_size.0;
                     idx.meta_bin_size = bin_size.1;
@@ -231,6 +264,56 @@ impl IndexPool {
         }
 
         Some(is_new)
+    }
+
+    pub fn del_document(&self, url: &str) -> bool {
+        let mut found = false;
+        let mut shard_id = 0;
+        let mut doc_id = 0;
+        // 既存で登録されているかチェック
+        for index in &self.indexes {
+            match index.read() {
+                Ok(idx) => {
+                    if let Some(meta) = idx.meta_from_url(url) {
+                        // 既に登録されている
+                        shard_id = idx.id;
+                        doc_id = meta.id;
+                        found = true;
+                        break;
+                    }
+                }
+                Err(_poison) => {
+                    warn!("RwLock poisoned, skipping");
+                    continue; // Skip poisoned lock
+                }
+            }
+        }
+        if found {
+            if let Ok(mut idx) = self.indexes[shard_id].write() {
+                idx.vectorizer.del_doc(&doc_id);
+                idx.vectorizer.update_idf();
+                // metaは先所しない、 削除するロジックにしたら多少ファイルサイズ小さくなるかもだけどlock延長のほうが悪いとおもうので
+                // idx.meta.retain(|m| m.id != doc_id);
+                idx.update_count += 1;
+                self.counter.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                error!("RwLock poisoned for index id {}, skipping", shard_id);
+                return false;
+            }
+        }
+        found
+    }
+
+    /// Load indexes and corpus from the specified directory
+    /// if not found corpus, create new instance
+    pub fn load_or_new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        match Self::load(path) {
+            Ok(pool) => Ok(pool),
+            Err(e) => {
+                warn!("Failed to load index pool from {}: {}, creating new instance", path, e);
+                Ok(Self::new(path))
+            }
+        }
     }
 
     /// Load indexes and corpus from the specified directory
@@ -356,11 +439,14 @@ impl IndexPool {
 
         let mut indexes = Vec::with_capacity(DEFAULT_INDEX_SHARD_NUM);
 
-        for i in (0..DEFAULT_INDEX_SHARD_NUM) {
+        let mut counter: u64 = 0;
+
+        for i in 0..DEFAULT_INDEX_SHARD_NUM {
             let vectorizer = vectorizer_map.remove(&i).ok_or_else(|| {
                 log::error!("No vectorizer found for index id {}", i);
                 Box::new(Error::new(std::io::ErrorKind::NotFound, "Vectorizer not found"))
             })?;
+            counter += vectorizer.doc_num() as u64;
             let vectorizer_bin_size = bincode::serialized_size(&vectorizer)?;
             let meta = meta_map.remove(&i).ok_or_else(|| {
                 log::error!("No meta found for index id {}", i);
@@ -370,7 +456,7 @@ impl IndexPool {
             indexes.push(Arc::new(RwLock::new(Index::with_vectorizer(i, vectorizer, meta, vectorizer_bin_size, meta_bin_size))));
         }
 
-        Ok(Self { corpus, indexes })
+        Ok(Self { corpus, indexes, index_dir: path.to_string(), counter: AtomicU64::new(counter) })
     }
 
     /// Save indexes and corpus to the specified directory
@@ -563,7 +649,6 @@ pub struct IndexMeta {
     /// - Shopping: amazon, rakuten, ebay, etc
     /// - Academic: arxiv, ciNii, etc
     /// - Tools: translate, map, etc
-    /// - Others: uncategorized
     pub tags: Tags,
 }
 
@@ -585,13 +670,19 @@ impl Tags {
         Self(set)
     }
 
-    /// 完全一致するか
-    pub fn is_filter_contains<T: Into<u64>>(&self, tag: T) -> bool {
-        (self.0 ^ tag.into()) == 0
+    /// すべて満たしてるか
+    /// tagはselfに含まれている必要がある
+    /// eg: is_filter_contains(Tags::NEWS | Tags::BLOG) -> NEWSとBLOGの両方を含む場合のみtrue
+    pub fn is_filter_contains<T: Into<u64> + Copy>(&self, tag: T) -> bool {
+        (self.0 & tag.into()) == tag.into()
     }
 
     pub fn contains<T: Into<u64>>(&self, tag: T) -> bool {
         (self.0 & tag.into()) != 0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
     }
 
     pub fn tags(&self) -> Vec<Box<str>> {
@@ -605,6 +696,25 @@ impl Tags {
         if self.contains(Self::ACADEMIC) { result.push("ACADEMIC".into()); }
         if self.contains(Self::TOOLS) { result.push("TOOLS".into()); }
         result
+    }
+
+    pub fn from_strs<T>(tags: &[T]) -> Self
+    where
+        T: AsRef<str>,
+    {
+        let mut set = 0;
+        for tag in tags {
+            let s = tag.as_ref();
+            if s.eq_ignore_ascii_case("wiki")      { set |= Self::WIKI; }
+            else if s.eq_ignore_ascii_case("news") { set |= Self::NEWS; }
+            else if s.eq_ignore_ascii_case("sns")  { set |= Self::SNS; }
+            else if s.eq_ignore_ascii_case("blog") { set |= Self::BLOG; }
+            else if s.eq_ignore_ascii_case("forum"){ set |= Self::FORUM; }
+            else if s.eq_ignore_ascii_case("shopping"){ set |= Self::SHOPPING; }
+            else if s.eq_ignore_ascii_case("academic"){ set |= Self::ACADEMIC; }
+            else if s.eq_ignore_ascii_case("tools"){ set |= Self::TOOLS; }
+        }
+        Self(set)
     }
 }
 
