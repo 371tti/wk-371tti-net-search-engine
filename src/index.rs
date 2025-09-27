@@ -186,13 +186,13 @@ impl IndexPool {
                             // 既に登録されている
                             shard_id = idx.id;
                             doc_id = meta.id;
-                        is_new = false;
-                        break;
+                            is_new = false;
+                            break;
                         }
                     }
                     // 見つからない場合もっとも負荷の低いシャードを選んでく
                     let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
-                    if max_size >= size {
+                    if max_size <= size {
                         shard_id = idx.id;
                         max_size = max_size;
                     }
