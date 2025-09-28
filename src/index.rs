@@ -177,30 +177,30 @@ impl IndexPool {
         let mut shard_id = 0;
         let mut doc_id = 0;
         // 既存で登録されているかチェック
-        let mut max_size = 0;
+        // 最小サイズシャード選択用 (初期は最大値)
+        let mut best_size: u64 = u64::MAX;
         for index in &self.indexes {
             match index.read() {
-                Ok(idx) => {
-                    if is_new {
-                        if let Some(meta) = idx.meta_from_url(&url) {
-                            // 既に登録されている
-                            shard_id = idx.id;
-                            doc_id = meta.id;
-                            is_new = false;
-                            break;
-                        }
-                    }
-                    // 見つからない場合もっとも負荷の低いシャードを選んでく
-                    let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
-                    if max_size <= size {
-                        shard_id = idx.id;
-                        max_size = max_size;
-                    }
+            Ok(idx) => {
+                if is_new {
+                if let Some(m) = idx.meta_from_url(&url) {
+                    shard_id = idx.id;
+                    doc_id = m.id;
+                    is_new = false;
+                    break;
                 }
-                Err(_poison) => {
-                    warn!("RwLock poisoned, skipping");
-                    continue; // Skip poisoned lock
                 }
+                // 未登録なら最もサイズの小さいシャードへ
+                let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
+                if size <= best_size {
+                best_size = size;
+                shard_id = idx.id;
+                }
+            }
+            Err(_poison) => {
+                warn!("RwLock poisoned, skipping");
+                continue;
+            }
             }
         }
         let do_save;
