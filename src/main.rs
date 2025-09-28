@@ -166,6 +166,35 @@ async fn main() {
         }
     });
 
+    kurosabi.get("/del/*", |mut c| async move {
+        // パスパラメータからurlを取得
+        let full_path = &c.req.path.path;
+        let del_part = if let Some(idx) = full_path.find("/del/") {
+            &full_path[idx + 5..]
+        } else {
+            full_path
+        };
+
+        let success = c.c.index_pool.del_document(del_part);
+
+        if success {
+            let result = serde_json::json!({
+                "success": true,
+                "url": del_part,
+            });
+            c.res.json_value(&result);
+            c.res.set_status(200);
+        } else {
+            let result = serde_json::json!({
+                "success": false,
+                "error": "Document not found",
+            });
+            c.res.json_value(&result);
+            c.res.set_status(404);
+        }
+        c
+    });
+
     kurosabi.get("/search", |mut c| async move {
         // query（URLエンコードされている可能性があるためデコード）
         let query_str = match c.req.path.get_query("query") {
