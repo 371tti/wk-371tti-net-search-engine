@@ -20,10 +20,10 @@ REST_SUMMARY = f"https://{LANG}.wikipedia.org/api/rest_v1/page/summary/"
 PAGE_URL_PREFIX = f"https://{LANG}.wikipedia.org/wiki/"
 
 SEARCH_ENGINE_ADD = os.getenv("SEARCH_ADD_ENDPOINT", "https://dev.371tti.net/api/index")
-BATCH_FEATURED = int(os.getenv("BATCH_FEATURED", "3"))
-BATCH_GOOD = int(os.getenv("BATCH_GOOD", "4"))
-BATCH_TOPVIEW = int(os.getenv("BATCH_TOPVIEW", "5"))
-BATCH_RANDOM = int(os.getenv("BATCH_RANDOM", "12"))
+BATCH_FEATURED = int(os.getenv("BATCH_FEATURED", "0"))
+BATCH_GOOD = int(os.getenv("BATCH_GOOD", "0"))
+BATCH_TOPVIEW = int(os.getenv("BATCH_TOPVIEW", "0"))
+BATCH_RANDOM = int(os.getenv("BATCH_RANDOM", "24"))
 BATCH_MAX = int(os.getenv("BATCH_MAX", "24"))
 
 LOOP_SLEEP = float(os.getenv("LOOP_SLEEP", "1"))      # 1 メインループ後の待機
