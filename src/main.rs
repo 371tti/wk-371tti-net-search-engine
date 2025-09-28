@@ -16,7 +16,7 @@ use crate::{collect::{IndexReq, IndexRes, ScraperResult, SearchRes}, context::Se
 
 pub const INDEX_DIR: &str = "./index_data";
 pub const SCRAPER_API_URL: &str = "http://localhost:88/url/";
-pub const MAX_DESC_LENGTH: usize = 200; // 説明文の最大長
+pub const MAX_DESC_LENGTH: usize = 100; // 説明文の最大長
 pub const MAX_TITLE_LENGTH: usize = 100; // タイトルの最大長
 pub const MAX_SEARCH_RESULTS: usize = 1000; // 検索結果の最大数
 pub const DEFAULT_SEARCH_RESULTS: usize = 20; // 検索結果のデフォルト数
