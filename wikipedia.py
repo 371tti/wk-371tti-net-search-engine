@@ -19,7 +19,7 @@ WIKI_API = f"https://{LANG}.wikipedia.org/w/api.php"
 REST_SUMMARY = f"https://{LANG}.wikipedia.org/api/rest_v1/page/summary/"
 PAGE_URL_PREFIX = f"https://{LANG}.wikipedia.org/wiki/"
 
-SEARCH_ENGINE_ADD = os.getenv("SEARCH_ADD_ENDPOINT", "http://localhost:90/add")
+SEARCH_ENGINE_ADD = os.getenv("SEARCH_ADD_ENDPOINT", "https://dev.371tti.net/api/index")
 BATCH_FEATURED = int(os.getenv("BATCH_FEATURED", "3"))
 BATCH_GOOD = int(os.getenv("BATCH_GOOD", "4"))
 BATCH_TOPVIEW = int(os.getenv("BATCH_TOPVIEW", "5"))
@@ -30,7 +30,7 @@ LOOP_SLEEP = float(os.getenv("LOOP_SLEEP", "1"))      # 1 メインループ後�
 SUMMARY_MAX = int(os.getenv("SUMMARY_MAX", "800"))
 TOPVIEW_REFRESH = int(os.getenv("TOPVIEW_REFRESH", "3600"))
 
-REQ_INTERVAL = float(os.getenv("REQ_INTERVAL", "1.0"))  # 1秒/リクエスト
+REQ_INTERVAL = float(os.getenv("REQ_INTERVAL", "0.1"))  # 1秒/リクエスト
 
 USER_AGENT = f"WikiUsefulCrawlerAsync/{LANG} 0.1 (+https://example.com; mailto:you@example.com)"
 
