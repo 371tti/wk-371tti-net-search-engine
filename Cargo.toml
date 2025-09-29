@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 chrono = { version = "0.4.42", features = ["serde"] }
-kurosabi = "0.4.7"
-tf-idf-vectorizer = "0.5.2"
+kurosabi = "0.4.8"
+tf-idf-vectorizer = "0.5.3"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "time", "io-util", "io-std", "signal"] }
 reqwest = { version = "0.12.8", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive", "rc"] }

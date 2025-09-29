@@ -951,9 +951,9 @@ dependencies = [
 
 [[package]]
 name = "kurosabi"
-version = "0.4.7"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdea19232261ad113a9fb281c5b42140af8d4f0d7bfd5899b6cb51ef3e8e54b3"
+checksum = "e875f67652ef09320d7576d2ae063e399b7fe916459c5286c5fa06d706ca0518"
 dependencies = [
  "ahash",
  "async-compression",
@@ -1786,9 +1786,9 @@ dependencies = [
 
 [[package]]
 name = "tf-idf-vectorizer"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1c46fa2a832c92c2cad1ecdd97969bf25284406136c655e4611866423b246f9"
+checksum = "c701e80b8adacd3beee41791d1012acfad055dbe25d1d3ae27caf959cac4f85f"
 dependencies = [
  "ahash",
  "dashmap",
