@@ -1,6 +1,6 @@
 use reqwest::Client;
-use crate::collect::ScraperResult;
 
+use crate::collect::ScraperResult;
 // ScraperResult を直接返す
 pub async fn fetch_scraper_api(
     api_url: &str,

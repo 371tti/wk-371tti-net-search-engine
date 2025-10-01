@@ -19,25 +19,18 @@ impl SudachiMode {
     }
 }
 
-/// 外部コマンド sudachi を使って日本語トークン化する
-/// - 入力: &str
-/// - 出力: Vec<String>（wakati出力を空白区切りで分割）
-/// 失敗時はエラーを返す。
-pub fn sudachi_tokenize(input: &str) -> Result<Vec<String>, SudachiError> {
-    sudachi_tokenize_with_mode(input, SudachiMode::A)
-}
-
-/// 分割モード指定版（表記ゆれをなくし正規化形で返す）
-pub fn sudachi_tokenize_with_mode(
+/// 分割モード指定版（正規化有効）
+pub fn sudachi_tokenize_with_mode_normalized(
     input: &str,
     mode: SudachiMode,
 ) -> Result<Vec<String>, SudachiError> {
     let mut child = Command::new("sudachi")
-        .arg("-a") // 全情報出力
+        .arg("-a")
         .arg("-m")
         .arg(mode.as_str())
         .arg("--split-sentences")
         .arg("no")
+        // .arg("--normalize") は付けない
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -60,6 +53,45 @@ pub fn sudachi_tokenize_with_mode(
         .lines()
         .filter(|line| !line.trim().is_empty() && !line.starts_with("EOS"))
         .filter_map(|line| line.split('\t').nth(2))
+        .map(|s| s.to_string())
+        .collect();
+    Ok(tokens)
+}
+
+/// 分割モード指定版（正規化無効）
+pub fn sudachi_tokenize_with_mode_raw(
+    input: &str,
+    mode: SudachiMode,
+) -> Result<Vec<String>, SudachiError> {
+    let mut child = Command::new("sudachi")
+        .arg("-a")
+        .arg("-m")
+        .arg(mode.as_str())
+        .arg("--split-sentences")
+        .arg("no")
+        // .arg("--normalize") は付けない
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(SudachiError::Spawn)?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(input.as_bytes()).map_err(SudachiError::Io)?;
+    }
+    let output = child.wait_with_output().map_err(SudachiError::Io)?;
+
+    if !output.status.success() {
+        return Err(SudachiError::Exit(
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+
+    let text = String::from_utf8(output.stdout).map_err(SudachiError::Utf8)?;
+    let tokens = text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with("EOS"))
+        .filter_map(|line| line.split('\t').nth(0))
         .map(|s| s.to_string())
         .collect();
     Ok(tokens)
@@ -113,17 +145,33 @@ pub fn split_for_sudachi(text: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
-/// 長文を安全にトークン化。内部でチャンク分割し連結。
-pub fn sudachi_tokenize_large(
+/// 長文を安全にトークン化（正規化有効）
+pub fn sudachi_tokenize_large_normalized(
     text: &str,
     mode: SudachiMode,
     max_chunk: usize,
 ) -> Result<Vec<String>, SudachiError> {
-    let max_chunk = max_chunk.max(64); // 最低サイズ
+    let max_chunk = max_chunk.max(64);
     let chunks = split_for_sudachi(text, max_chunk);
     let mut tokens = Vec::new();
     for c in chunks {
-        let mut part = sudachi_tokenize_with_mode(&c, mode)?;
+        let mut part = sudachi_tokenize_with_mode_normalized(&c, mode)?;
+        tokens.append(&mut part);
+    }
+    Ok(tokens)
+}
+
+/// 長文を安全にトークン化（正規化無効）
+pub fn sudachi_tokenize_large_raw(
+    text: &str,
+    mode: SudachiMode,
+    max_chunk: usize,
+) -> Result<Vec<String>, SudachiError> {
+    let max_chunk = max_chunk.max(64);
+    let chunks = split_for_sudachi(text, max_chunk);
+    let mut tokens = Vec::new();
+    for c in chunks {
+        let mut part = sudachi_tokenize_with_mode_raw(&c, mode)?;
         tokens.append(&mut part);
     }
     Ok(tokens)
@@ -133,16 +181,25 @@ pub fn sudachi_tokenize_large(
 mod tests {
     use super::*;
 
-    // 外部コマンド依存のため、デフォルトでは無効化
-    #[ignore]
+    /// 正規化有効バージョンのテスト（3列目）
+    /// 実行時は cargo test -- --nocapture で出力を確認
     #[test]
-    fn test_sudachi_tokenize() {
-        let text = "今日は良い天気ですね。";
-        let tokens = sudachi_tokenize(text).expect("sudachi tokenize failed");
-        println!("{:?}", tokens);
+    fn test_sudachi_tokenize_with_mode_normalized() {
+        let text = "東京国立博物館よりどらえもんより今日は良い天気ですね。";
+        let tokens = sudachi_tokenize_with_mode_normalized(text, SudachiMode::A).expect("normalized failed");
+        println!("normalized: {:?}", tokens);
         assert!(!tokens.is_empty());
     }
 
+    /// 正規化無効バージョンのテスト（1列目）
+    /// 実行時は cargo test -- --nocapture で出力を確認
+    #[test]
+    fn test_sudachi_tokenize_with_mode_raw() {
+        let text = "東京国立博物館よりどらえもんより今日は良い天気ですね。";
+        let tokens = sudachi_tokenize_with_mode_raw(text, SudachiMode::C).expect("raw failed");
+        println!("raw: {:?}", tokens);
+        assert!(!tokens.is_empty());
+    }
     #[test]
     fn test_split_for_sudachi() {
         let long = "これはテストです。これは二文目です！そして三文目です？改行も\n入ります。";

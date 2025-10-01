@@ -19,7 +19,7 @@ WIKI_API = f"https://{LANG}.wikipedia.org/w/api.php"
 REST_SUMMARY = f"https://{LANG}.wikipedia.org/api/rest_v1/page/summary/"
 PAGE_URL_PREFIX = f"https://{LANG}.wikipedia.org/wiki/"
 
-SEARCH_ENGINE_ADD = os.getenv("SEARCH_ADD_ENDPOINT", "https://dev.371tti.net/api/index")
+SEARCH_ENGINE_ADD = os.getenv("SEARCH_ADD_ENDPOINT", "http://localhost:90/add")
 BATCH_FEATURED = int(os.getenv("BATCH_FEATURED", "0"))
 BATCH_GOOD = int(os.getenv("BATCH_GOOD", "0"))
 BATCH_TOPVIEW = int(os.getenv("BATCH_TOPVIEW", "0"))

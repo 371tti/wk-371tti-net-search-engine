@@ -8,11 +8,10 @@ mod index;
 use kurosabi::Kurosabi;
 use log::{debug, info, warn, LevelFilter};
 use tokio::signal;
+use crate::{collect::{IndexReq, IndexRes, ScraperResult, SearchRes}, context::SearchContext, index::{IndexMeta, Tags}, tokenize::{sudachi_tokenize_large_raw, SudachiMode}, http_client::fetch_scraper_api};
 use std::{io::Write, sync::atomic::{AtomicBool, Ordering}};
 use percent_encoding::percent_decode_str;
 use tf_idf_vectorizer::{SimilarityAlgorithm, TokenFrequency};
-
-use crate::{collect::{IndexReq, IndexRes, ScraperResult, SearchRes}, context::SearchContext, http_client::fetch_scraper_api, index::{IndexMeta, Tags}, tokenize::{sudachi_tokenize_large, SudachiMode}};
 
 pub const INDEX_DIR: &str = "./index_data";
 pub const SCRAPER_API_URL: &str = "http://localhost:88/url/";
@@ -24,7 +23,7 @@ pub const DEFAULT_SEARCH_RESULTS: usize = 20; // 検索結果のデフォルト�
 static CTRL_C_SAVED: AtomicBool = AtomicBool::new(false);
 
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
     init_logging();
     info!("Logger initialized");
@@ -130,7 +129,7 @@ async fn main() {
                     tags 
                 };
 
-                let tokens = match sudachi_tokenize_large(body, SudachiMode::A, 2000) {
+                let tokens = match sudachi_tokenize_large_raw(body, SudachiMode::A, 2000) {
                     Ok(t) => t,
                     Err(e) => {
                         warn!("sudachi_tokenize_large error: {}", e);
@@ -251,7 +250,7 @@ async fn main() {
         debug!("tag_exclusive={}", tag_exclusive);
 
         // tokenize (Sudachi 正規化)
-        let tokens = match sudachi_tokenize_large(&query_str, SudachiMode::A, 2000) {
+        let tokens = match sudachi_tokenize_large_raw(&query_str, SudachiMode::A, 2000) {
             Ok(t) => t,
             Err(e) => {
                 warn!("sudachi_tokenize_large error: {}", e);
@@ -296,6 +295,7 @@ async fn main() {
     kurosabi
         .server()
         .port(90)
+        .thread(16)
         .host([0,0,0,0])
         .build()
         .run_async()
