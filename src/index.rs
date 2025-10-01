@@ -23,7 +23,6 @@ pub struct IndexPool {
 }
 
 pub const DEFAULT_INDEX_SHARD_NUM: usize = 16;
-pub const MAX_FILE_SIZE: usize = 200 * 1024 * 1024; // 200MB
 pub const CALCULATE_BIN_SIZE_INTERVAL: usize = 20; // 20回更新ごとにバイナリサイズを再計算
 pub const SAVE_FILE_INTERVAL: usize = 100; // 100回更新ごとにディスクに保存
 
@@ -626,6 +625,7 @@ impl Index {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMeta {
     pub id: usize,
+    pub token_count: u64,
     /// URL
     /// only URL is used for Hash and Equal
     pub url: Box<str>,
@@ -633,8 +633,12 @@ pub struct IndexMeta {
     pub title: Box<str>,
     /// Description
     pub description: Box<str>,
+    /// links
+    pub links: Vec<Box<str>>,
     /// Favicon URL
     pub favicon: Option<Box<str>>,
+    /// language code (e.g. "en", "ja", etc)
+    pub lang: Option<Box<str>>,
     /// Upload Time
     pub time: DateTime<Utc>,
     /// Score
