@@ -341,40 +341,6 @@ fn parse_algo(s: &str) -> SimilarityAlgorithm {
         SimilarityAlgorithm::Dot
     } else if lower.starts_with("cosine") || lower.starts_with("cosinesimilarity") {
         SimilarityAlgorithm::CosineSimilarity
-    } else if lower.starts_with("bm25plus") {
-        let v = nums(&lower);
-        let k1 = v.get(0).copied().unwrap_or(1.2);
-        let b = v.get(1).copied().unwrap_or(0.75);
-        let delta = v.get(2).copied().unwrap_or(0.5);
-        SimilarityAlgorithm::BM25plus(k1, b, delta)
-    } else if lower.starts_with("bm25l") {
-        let v = nums(&lower);
-        let k1 = v.get(0).copied().unwrap_or(1.2);
-        let b = v.get(1).copied().unwrap_or(0.75);
-        SimilarityAlgorithm::BM25L(k1, b)
-    } else if lower.starts_with("bm25cosinenormalizedlinearcombination") {
-        let v = nums(&lower);
-        let k1 = v.get(0).copied().unwrap_or(1.2);
-        let b = v.get(1).copied().unwrap_or(0.75);
-        let alpha = v.get(2).copied().unwrap_or(0.5);
-        SimilarityAlgorithm::BM25CosineNormalizedLinearCombination(k1, b, alpha)
-    } else if lower.starts_with("bm25cosinefilter") {
-        let v = nums(&lower);
-        let k1 = v.get(0).copied().unwrap_or(1.2);
-        let b = v.get(1).copied().unwrap_or(0.75);
-        SimilarityAlgorithm::BM25CosineFilter(k1, b)
-    } else if lower.starts_with("bm25prfcosinesimilarity") {
-        let v = nums(&lower);
-        let k1 = v.get(0).copied().unwrap_or(1.2);
-        let b = v.get(1).copied().unwrap_or(0.75);
-        let top_n = v.get(2).copied().unwrap_or(10.0) as usize;
-        let alpha = v.get(3).copied().unwrap_or(0.5);
-        SimilarityAlgorithm::BM25PrfCosineSimilarity(k1, b, top_n, alpha)
-    } else if lower.starts_with("bm25") {
-        let v = nums(&lower);
-        let k1 = v.get(0).copied().unwrap_or(1.2);
-        let b = v.get(1).copied().unwrap_or(0.75);
-        SimilarityAlgorithm::BM25(k1, b)
     } else {
         // 既定
         SimilarityAlgorithm::BM25(1.2, 0.75)

@@ -1786,15 +1786,14 @@ dependencies = [
 
 [[package]]
 name = "tf-idf-vectorizer"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c701e80b8adacd3beee41791d1012acfad055dbe25d1d3ae27caf959cac4f85f"
+checksum = "96e22c69e9c81d12f3108849435ce27d0d983c6ef148c77f44e14fa4266938bd"
 dependencies = [
  "ahash",
  "dashmap",
  "indexmap",
  "num",
- "rayon",
  "serde",
 ]
 
