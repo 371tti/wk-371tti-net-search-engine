@@ -1,5 +1,57 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+
+use sudachi::analysis::stateless_tokenizer::{DictionaryAccess, StatelessTokenizer};
+use sudachi::config::Config;
+use sudachi::dic::dictionary::JapaneseDictionary;
+use sudachi::dic::{DictionaryLoader, LoadedDictionary};
+use sudachi::prelude::*;
+use sudachi::analysis::Tokenize;
+
+/// std io 経由で呼び出すのが遅いので、Sudachiのライブラリを直接使う版
+pub struct SudachiTokenizer {
+    dictionary: Arc<JapaneseDictionary>,
+}
+
+impl SudachiTokenizer {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let config = Config::default();
+        let dict = Arc::new(JapaneseDictionary::from_cfg(&config)?);
+        Ok(Self { dictionary: dict })
+    }
+
+    fn new_tokenizer(&self) -> StatelessTokenizer<Arc<JapaneseDictionary>> {
+        StatelessTokenizer::new(Arc::clone(&self.dictionary))
+    }
+
+    pub fn tokenize(&self, text: &str) -> Vec<Box<str>> {
+        let tokenizer = self.new_tokenizer();
+        let result = tokenizer.tokenize(text, Mode::A, false).unwrap();
+        result.iter().map(|t| {
+            t.surface().to_string().into_boxed_str()
+        }).collect()
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /// Sudachiの分割モード
 #[derive(Clone, Copy, Debug)]
