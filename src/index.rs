@@ -625,7 +625,6 @@ impl Index {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMeta {
     pub id: usize,
-    // pub token_count: u64,
     /// URL
     /// only URL is used for Hash and Equal
     pub url: Box<str>,
@@ -634,11 +633,11 @@ pub struct IndexMeta {
     /// Description
     pub description: Box<str>,
     /// links
-    // pub links: Vec<Box<str>>,
+    pub links: Vec<Box<str>>,
     /// Favicon URL
     pub favicon: Option<Box<str>>,
     /// language code (e.g. "en", "ja", etc)
-    // pub lang: Option<Box<str>>,
+    pub lang: Option<Box<str>>,
     /// Upload Time
     pub time: DateTime<Utc>,
     /// Score

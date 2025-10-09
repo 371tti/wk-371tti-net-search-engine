@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use kurosabi::context::ContextMiddleware;
 
-use crate::index::IndexPool;
+use crate::{index::IndexPool, tokenize::SudachiTokenizer};
 
 #[derive(Clone)]
 pub struct SearchContext {
     pub index_pool: Arc<IndexPool>,
+    pub sudachi_tokenizer: Arc<SudachiTokenizer>,
 }
 
 impl SearchContext {
@@ -20,7 +21,7 @@ impl SearchContext {
                 panic!("Failed to load or create index pool: {}", e);
             }
         };
-        Self { index_pool }
+        Self { index_pool, sudachi_tokenizer: Arc::new(SudachiTokenizer::new().expect("Config file not found")) }
     }
 }
 

@@ -8,7 +8,7 @@ mod index;
 use kurosabi::Kurosabi;
 use log::{debug, info, warn, LevelFilter};
 use tokio::signal;
-use crate::{collect::{IndexReq, IndexRes, ScraperResult, SearchRes}, context::SearchContext, index::{IndexMeta, Tags}, tokenize::{sudachi_tokenize_large_raw, SudachiMode}, http_client::fetch_scraper_api};
+use crate::{collect::{IndexReq, IndexRes, ScraperResult, SearchRes}, context::SearchContext, index::{IndexMeta, Tags}, http_client::fetch_scraper_api};
 use std::{io::Write, sync::atomic::{AtomicBool, Ordering}};
 use percent_encoding::percent_decode_str;
 use tf_idf_vectorizer::{SimilarityAlgorithm, TokenFrequency};
@@ -113,10 +113,10 @@ async fn main() {
                 };
                 
                 let favicon: Option<Box<str>> = index_req.favicon.or_else(|| results.favicon.first().cloned()).map(|s| s.into_boxed_str());
-
                 let url = url.into_boxed_str();
-
                 let tags = Tags::from_strs(&index_req.tags);
+                let lang = results.lang.first().map(|s| s.clone().into_boxed_str());
+                let links = results.links.into_iter().map(|v| v.into_boxed_str()).collect();
 
                 let meta = IndexMeta { 
                     id: 0, 
@@ -124,12 +124,14 @@ async fn main() {
                     title, 
                     description, 
                     favicon, 
+                    lang,
                     time: chrono::Utc::now(), 
                     points: 0.0, 
-                    tags 
+                    tags,
+                    links
                 };
 
-                let tokens = match sudachi_tokenize_large_raw(body, SudachiMode::A, 2000) {
+                let tokens = match c.c.sudachi_tokenizer.mix_doc_tokenizer(&body) {
                     Ok(t) => t,
                     Err(e) => {
                         warn!("sudachi_tokenize_large error: {}", e);
@@ -155,7 +157,7 @@ async fn main() {
                 c.res.set_status(200);
                 return c;
             }
-            ScraperResult::Failed { error , success } => {
+            ScraperResult::Failed { error , success: _ } => {
                 warn!("Scraper API returned error: {}", error);
                 let result = IndexRes::Failed { error: format!("Scraper API error: {}", error) };
                 c.res.json_value(&serde_json::to_value(&result).unwrap());
@@ -250,7 +252,7 @@ async fn main() {
         debug!("tag_exclusive={}", tag_exclusive);
 
         // tokenize (Sudachi 正規化)
-        let tokens = match sudachi_tokenize_large_raw(&query_str, SudachiMode::A, 2000) {
+        let tokens = match c.c.sudachi_tokenizer.mix_query_tokenizer(&query_str) {
             Ok(t) => t,
             Err(e) => {
                 warn!("sudachi_tokenize_large error: {}", e);

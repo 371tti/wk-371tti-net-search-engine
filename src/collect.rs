@@ -31,7 +31,7 @@ pub enum SearchRes {
     #[serde(rename = "true")]
     Success {
         query: String,
-        tokenize_query: Vec<String>,
+        tokenize_query: Vec<Box<str>>,
         algorithm: String,
         range: Range<usize>,
         results: Vec<ResEntry>,

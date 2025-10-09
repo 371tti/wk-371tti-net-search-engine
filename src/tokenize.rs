@@ -1,14 +1,9 @@
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use serde::Serialize;
-use serde_json::error;
-use sudachi::analysis::stateless_tokenizer::{DictionaryAccess, StatelessTokenizer};
-use sudachi::config::{Config, ConfigBuilder};
+use sudachi::analysis::stateless_tokenizer::StatelessTokenizer;
+use sudachi::config::Config;
 use sudachi::dic::dictionary::JapaneseDictionary;
-use sudachi::dic::{DictionaryLoader, LoadedDictionary};
 use sudachi::prelude::*;
 use sudachi::analysis::Tokenize;
 
@@ -18,7 +13,7 @@ pub struct SudachiTokenizer {
 }
 
 impl SudachiTokenizer {
-    const SUDACHI_CONFIG: &str = "config.json";
+    const SUDACHI_CONFIG: &str = "./config/sudachi.json";
 
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let config = Config::new(Some(PathBuf::from(Self::SUDACHI_CONFIG)), None, None)?;
@@ -46,11 +41,39 @@ impl SudachiTokenizer {
     pub fn mix_doc_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error>> {
         let c = self.tokenize(text, Mode::C)?;
         let a = self.tokenize(text, Mode::A)?;
-        let normalized_c = c.normalized_tokens();
-
+        let normalized_c_tokens = c.normalized_tokens();
+        let a_tokens = a.tokens();
+        let a_2gram_tokens: Vec<Box<str>> = a_tokens.windows(2)
+            .map(|w| format!("{}{}", w[0], w[1]).into_boxed_str())
+            .collect();
+        let a_speech_tokens = a.speech_tokens();
+        let synthetic_tokens: Vec<Box<str>> = normalized_c_tokens.into_iter()
+            .chain(a_2gram_tokens.into_iter())
+            .chain(a_speech_tokens.into_iter())
+            .collect();
+        Ok(synthetic_tokens)
     }
 
+    pub fn pure_query_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error>> {
+        let c = self.tokenize(text, Mode::C)?;
+        Ok(c.normalized_tokens())
+    }
 
+    pub fn mix_query_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error>> {
+        let c = self.tokenize(text, Mode::C)?;
+        let a = self.tokenize(text, Mode::A)?;
+        let normalized_c_tokens = c.normalized_tokens();
+        let a_tokens = a.tokens();
+        let a_2gram_tokens: Vec<Box<str>> = a_tokens.windows(2)
+            .map(|w| format!("{}{}", w[0], w[1]).into_boxed_str())
+            .collect();
+        let a_speech_tokens = a.speech_tokens();
+        let synthetic_tokens: Vec<Box<str>> = normalized_c_tokens.into_iter()
+            .chain(a_2gram_tokens.into_iter())
+            .chain(a_speech_tokens.into_iter())
+            .collect();
+        Ok(synthetic_tokens)
+    }
 }
 
 pub struct Tokenized {
@@ -61,246 +84,24 @@ impl Tokenized {
     pub fn normalized_tokens(&self) -> Vec<Box<str>> {
         self.result
             .iter()
-            .map(|m| m.normalized_form().to_string().into_boxed_str())
+            .map(|s| s.normalized_form().trim_matches(&[' ', '　']).to_string().into_boxed_str())
+            .filter(|s| !s.is_empty())
             .collect()
     }
 
     pub fn tokens(&self) -> Vec<Box<str>> {
         self.result
             .iter()
-            .map(|m| m.surface().to_string().into_boxed_str())
+            .map(|m| m.surface().trim_matches(&[' ', '　']).to_string().into_boxed_str())
+            .filter(|s| !s.is_empty())
             .collect()
     }
 
     pub fn speech_tokens(&self) -> Vec<Box<str>> {
         self.result
             .iter()
-            .map(|m| m.reading_form().to_string().into_boxed_str())
+            .map(|m| m.reading_form().replace("キゴウ", "").trim().to_string().into_boxed_str())
+            .filter(|s| !s.is_empty())
             .collect()
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/// Sudachiの分割モード
-#[derive(Clone, Copy, Debug)]
-pub enum SudachiMode {
-    A,
-    B,
-    C,
-}
-
-impl SudachiMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            SudachiMode::A => "A",
-            SudachiMode::B => "B",
-            SudachiMode::C => "C",
-        }
-    }
-}
-
-/// 分割モード指定版（正規化有効）
-pub fn sudachi_tokenize_with_mode_normalized(
-    input: &str,
-    mode: SudachiMode,
-) -> Result<Vec<String>, SudachiError> {
-    let mut child = Command::new("sudachi")
-        .arg("-a")
-        .arg("-m")
-        .arg(mode.as_str())
-        .arg("--split-sentences")
-        .arg("no")
-        // .arg("--normalize") は付けない
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(SudachiError::Spawn)?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(input.as_bytes()).map_err(SudachiError::Io)?;
-    }
-    let output = child.wait_with_output().map_err(SudachiError::Io)?;
-
-    if !output.status.success() {
-        return Err(SudachiError::Exit(
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    let text = String::from_utf8(output.stdout).map_err(SudachiError::Utf8)?;
-    let tokens = text
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.starts_with("EOS"))
-        .filter_map(|line| line.split('\t').nth(2))
-        .map(|s| s.to_string())
-        .collect();
-    Ok(tokens)
-}
-
-/// 分割モード指定版（正規化無効）
-pub fn sudachi_tokenize_with_mode_raw(
-    input: &str,
-    mode: SudachiMode,
-) -> Result<Vec<String>, SudachiError> {
-    let mut child = Command::new("sudachi")
-        .arg("-a")
-        .arg("-m")
-        .arg(mode.as_str())
-        .arg("--split-sentences")
-        .arg("no")
-        // .arg("--normalize") は付けない
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(SudachiError::Spawn)?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(input.as_bytes()).map_err(SudachiError::Io)?;
-    }
-    let output = child.wait_with_output().map_err(SudachiError::Io)?;
-
-    if !output.status.success() {
-        return Err(SudachiError::Exit(
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    let text = String::from_utf8(output.stdout).map_err(SudachiError::Utf8)?;
-    let tokens = text
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.starts_with("EOS"))
-        .filter_map(|line| line.split('\t').nth(0))
-        .map(|s| s.to_string())
-        .collect();
-    Ok(tokens)
-}
-
-#[derive(Debug)]
-pub enum SudachiError {
-    Spawn(std::io::Error),
-    Io(std::io::Error),
-    Utf8(std::string::FromUtf8Error),
-    Exit(i32, String),
-}
-
-impl std::fmt::Display for SudachiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SudachiError::Spawn(e) => write!(f, "failed to spawn sudachi: {}", e),
-            SudachiError::Io(e) => write!(f, "io error: {}", e),
-            SudachiError::Utf8(e) => write!(f, "utf8 error: {}", e),
-            SudachiError::Exit(code, stderr) => {
-                write!(f, "sudachi exited with code {}: {}", code, stderr)
-            }
-        }
-    }
-}
-
-impl std::error::Error for SudachiError {}
-
-/// 長文を Sudachi に渡すために句読点や記号で分割しつつ最大長を超えないチャンクへ分割する
-///
-/// 分割トリガ: 。！？!?,、, 改行 等
-/// max_len を超えそうな場合は強制切り。UTF-8境界は chars() ベースで安全に。
-pub fn split_for_sudachi(text: &str, max_len: usize) -> Vec<String> {
-    if text.is_empty() { return Vec::new(); }
-    let mut chunks = Vec::new();
-    let mut buf = String::with_capacity(max_len.min(4096));
-    for ch in text.chars() {
-        buf.push(ch);
-        let boundary = matches!(ch, '。' | '！' | '!' | '?' | '？' | '、' | ',' | '\n');
-        if boundary && buf.len() >= max_len / 2 { // ある程度溜まっていればここで切る
-            chunks.push(buf.trim().to_string());
-            buf = String::with_capacity(max_len.min(4096));
-            continue;
-        }
-        if buf.len() >= max_len { // 強制切り
-            chunks.push(buf.trim().to_string());
-            buf = String::with_capacity(max_len.min(4096));
-        }
-    }
-    if !buf.trim().is_empty() { chunks.push(buf.trim().to_string()); }
-    chunks
-}
-
-/// 長文を安全にトークン化（正規化有効）
-pub fn sudachi_tokenize_large_normalized(
-    text: &str,
-    mode: SudachiMode,
-    max_chunk: usize,
-) -> Result<Vec<String>, SudachiError> {
-    let max_chunk = max_chunk.max(64);
-    let chunks = split_for_sudachi(text, max_chunk);
-    let mut tokens = Vec::new();
-    for c in chunks {
-        let mut part = sudachi_tokenize_with_mode_normalized(&c, mode)?;
-        tokens.append(&mut part);
-    }
-    Ok(tokens)
-}
-
-/// 長文を安全にトークン化（正規化無効）
-pub fn sudachi_tokenize_large_raw(
-    text: &str,
-    mode: SudachiMode,
-    max_chunk: usize,
-) -> Result<Vec<String>, SudachiError> {
-    let max_chunk = max_chunk.max(64);
-    let chunks = split_for_sudachi(text, max_chunk);
-    let mut tokens = Vec::new();
-    for c in chunks {
-        let mut part = sudachi_tokenize_with_mode_raw(&c, mode)?;
-        tokens.append(&mut part);
-    }
-    Ok(tokens)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 正規化有効バージョンのテスト（3列目）
-    /// 実行時は cargo test -- --nocapture で出力を確認
-    #[test]
-    fn test_sudachi_tokenize_with_mode_normalized() {
-        let text = "東京国立博物館よりどらえもんより今日は良い天気ですね。";
-        let tokens = sudachi_tokenize_with_mode_normalized(text, SudachiMode::A).expect("normalized failed");
-        println!("normalized: {:?}", tokens);
-        assert!(!tokens.is_empty());
-    }
-
-    /// 正規化無効バージョンのテスト（1列目）
-    /// 実行時は cargo test -- --nocapture で出力を確認
-    #[test]
-    fn test_sudachi_tokenize_with_mode_raw() {
-        let text = "東京国立博物館よりどらえもんより今日は良い天気ですね。";
-        let tokens = sudachi_tokenize_with_mode_raw(text, SudachiMode::C).expect("raw failed");
-        println!("raw: {:?}", tokens);
-        assert!(!tokens.is_empty());
-    }
-    #[test]
-    fn test_split_for_sudachi() {
-        let long = "これはテストです。これは二文目です！そして三文目です？改行も\n入ります。";
-        let parts = split_for_sudachi(long, 20);
-        assert!(parts.len() >= 2);
-        for p in &parts { assert!(!p.is_empty()); }
     }
 }
