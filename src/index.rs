@@ -60,13 +60,37 @@ impl IndexPool {
     /// }
     /// ```
     pub fn per_similarity(&self, token_fq: &TokenFrequency, algorithm: &SimilarityAlgorithm) -> Vec<ScoredEntry> {
+        log::debug!("per_similarity called ");
         let result: Vec<ScoredEntry> = self.indexes
-            .iter().filter_map(|e| e.try_read().ok())
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                match e.try_read() {
+                    Ok(lock) => {
+                        log::debug!("Acquired read lock for index shard {}", i);
+                        Some(lock)
+                    },
+                    Err(e) => {
+                        log::warn!("Failed to acquire read lock for index shard {}: {}", i, e);
+                        None
+                    }
+                }
+            })
             .collect::<Vec<_>>()
-            .par_iter().flat_map(|idx| {
+            .par_iter()
+            .flat_map(|idx| {
+                log::debug!("Calculating similarity for index id {}", idx.id);
                 let mut result = Vec::new();
                 let hits = idx.vectorizer.similarity_uncheck_idf(token_fq, algorithm);
+                log::debug!("Index id {}: got {} hits", idx.id, hits.list.len());
                 hits.list.iter().for_each(|h| {
+                    log::debug!(
+                        "Index id {}: hit key={}, score={}, length={}",
+                        idx.id,
+                        h.0,
+                        h.1,
+                        h.2
+                    );
                     result.push(ScoredEntry {
                         score: h.1,
                         key: h.0,
@@ -75,7 +99,9 @@ impl IndexPool {
                     });
                 });
                 result
-            }).collect();
+            })
+            .collect();
+        log::debug!("per_similarity returning {} results", result.len());
         result
     }
 
