@@ -23,7 +23,7 @@ pub const DEFAULT_SEARCH_RESULTS: usize = 20; // 検索結果のデフォルト�
 static CTRL_C_SAVED: AtomicBool = AtomicBool::new(false);
 
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() {
     init_logging();
     info!("Logger initialized");
