@@ -1,9 +1,12 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use serde::Serialize;
+use serde_json::error;
 use sudachi::analysis::stateless_tokenizer::{DictionaryAccess, StatelessTokenizer};
-use sudachi::config::Config;
+use sudachi::config::{Config, ConfigBuilder};
 use sudachi::dic::dictionary::JapaneseDictionary;
 use sudachi::dic::{DictionaryLoader, LoadedDictionary};
 use sudachi::prelude::*;
@@ -15,8 +18,10 @@ pub struct SudachiTokenizer {
 }
 
 impl SudachiTokenizer {
+    const SUDACHI_CONFIG: &str = "config.json";
+
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let config = Config::default();
+        let config = Config::new(Some(PathBuf::from(Self::SUDACHI_CONFIG)), None, None)?;
         let dict = Arc::new(JapaneseDictionary::from_cfg(&config)?);
         Ok(Self { dictionary: dict })
     }
@@ -25,16 +30,55 @@ impl SudachiTokenizer {
         StatelessTokenizer::new(Arc::clone(&self.dictionary))
     }
 
-    pub fn tokenize(&self, text: &str) -> Vec<Box<str>> {
+    pub fn tokenize(&self, text: &str, mode: Mode) -> Result<Tokenized, Box<dyn std::error::Error>> {
         let tokenizer = self.new_tokenizer();
-        let result = tokenizer.tokenize(text, Mode::A, false).unwrap();
-        result.iter().map(|t| {
-            t.surface().to_string().into_boxed_str()
-        }).collect()
+        let result = tokenizer.tokenize(text, mode, false)?;
+        Ok(Tokenized {
+            result,
+        })
     }
+
+    pub fn pure_doc_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error>> {
+        let c = self.tokenize(text, Mode::C)?;
+        Ok(c.tokens())
+    }
+
+    pub fn mix_doc_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error>> {
+        let c = self.tokenize(text, Mode::C)?;
+        let a = self.tokenize(text, Mode::A)?;
+        let normalized_c = c.normalized_tokens();
+
+    }
+
+
 }
 
+pub struct Tokenized {
+    result: MorphemeList<Arc<JapaneseDictionary>>,
+}
 
+impl Tokenized {
+    pub fn normalized_tokens(&self) -> Vec<Box<str>> {
+        self.result
+            .iter()
+            .map(|m| m.normalized_form().to_string().into_boxed_str())
+            .collect()
+    }
+
+    pub fn tokens(&self) -> Vec<Box<str>> {
+        self.result
+            .iter()
+            .map(|m| m.surface().to_string().into_boxed_str())
+            .collect()
+    }
+
+    pub fn speech_tokens(&self) -> Vec<Box<str>> {
+        self.result
+            .iter()
+            .map(|m| m.reading_form().to_string().into_boxed_str())
+            .collect()
+    }
+}
 
 
 
