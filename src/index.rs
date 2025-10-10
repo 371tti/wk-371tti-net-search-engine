@@ -63,7 +63,7 @@ impl IndexPool {
         let result: Vec<ScoredEntry> = self.indexes
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| {
+            .filter_map(|(_, e)| {
                 match e.try_read() {
                     Ok(lock) => Some(lock),
                     Err(_) => None,
