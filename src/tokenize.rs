@@ -41,14 +41,19 @@ impl SudachiTokenizer {
     pub fn mix_doc_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error>> {
         let c = self.tokenize(text, Mode::C)?;
         let a = self.tokenize(text, Mode::A)?;
-        let normalized_c_tokens = c.tokens();
+        let mut c_tokens = c.tokens();
         let a_tokens = a.tokens();
+        c_tokens.sort();
+        let c_tokens_sub: Vec<Box<str>> = a_tokens.iter()
+            .filter(|t| !c_tokens.binary_search(*t).is_ok())
+            .cloned()
+            .collect();
         let a_2gram_tokens: Vec<Box<str>> = a_tokens.windows(2)
             .map(|w| format!("{}{}", w[0], w[1]).into_boxed_str())
             .collect();
         let a_speech_tokens = a.speech_tokens();
-        let synthetic_tokens: Vec<Box<str>> = normalized_c_tokens.into_iter()
-            .chain(a_tokens.into_iter())
+        let synthetic_tokens: Vec<Box<str>> = c_tokens.into_iter()
+            .chain(c_tokens_sub.into_iter())
             .chain(a_2gram_tokens.into_iter())
             .chain(a_speech_tokens.into_iter())
             .collect();
