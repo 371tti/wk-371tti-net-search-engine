@@ -102,13 +102,9 @@ impl SudachiTokenizer {
             .filter(|t| !c_tokens.binary_search(*t).is_ok())
             .cloned()
             .collect();
-        let a_2gram_tokens: Vec<Box<str>> = a_tokens.windows(2)
-            .map(|w| format!("{}{}", w[0], w[1]).into_boxed_str())
-            .collect();
         let a_speech_tokens = a.speech_tokens();
         let synthetic_tokens: Vec<Box<str>> = c_tokens.into_iter()
             .chain(c_tokens_sub.into_iter())
-            .chain(a_2gram_tokens.into_iter())
             .chain(a_speech_tokens.into_iter())
             .collect();
         Ok(synthetic_tokens)
@@ -135,7 +131,6 @@ impl SudachiTokenizer {
         let a_speech_tokens = a.speech_tokens();
         let synthetic_tokens: Vec<Box<str>> = c_tokens.into_iter()
             .chain(c_tokens_sub.into_iter())
-            .chain(a_2gram_tokens.into_iter())
             .chain(a_speech_tokens.into_iter())
             .collect();
         Ok(synthetic_tokens)
