@@ -2,15 +2,17 @@ use std::collections::HashMap;
 use std::io::Error;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-use log::{error, warn};
+use log::warn;
 use rayon::prelude::*;
 use chrono::{DateTime, Utc};
 use tf_idf_vectorizer::{Corpus, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
 use serde::{Serialize, Deserialize};
 
 use crate::collect::{ResEntry, ScoredEntry};
+use futures::stream::{FuturesUnordered, StreamExt};
 
 
 pub struct IndexPool {
@@ -59,33 +61,40 @@ impl IndexPool {
     ///     println!("Index ID: {}, Hits: {:?}", index_id, hits);
     /// }
     /// ```
-    pub fn per_similarity(&self, token_fq: &TokenFrequency, algorithm: &SimilarityAlgorithm) -> Vec<ScoredEntry> {
-        let result: Vec<ScoredEntry> = self.indexes
-            .iter()
-            .enumerate()
-            .filter_map(|(_, e)| {
-                match e.try_read() {
-                    Ok(lock) => Some(lock),
-                    Err(_) => None,
-                }
-            })
-            .collect::<Vec<_>>()
-            .par_iter()
-            .flat_map(|idx| {
-                let mut result = Vec::new();
-                let hits = idx.vectorizer.similarity_uncheck_idf(token_fq, algorithm);
-                hits.list.iter().for_each(|h| {
-                    result.push(ScoredEntry {
-                        score: h.1,
-                        key: h.0,
-                        length: h.2,
-                        index_id: idx.id,
-                    });
-                });
-                result
-            })
-            .collect();
-        result
+    pub async fn per_similarity(&self, token_fq: &TokenFrequency, algorithm: &SimilarityAlgorithm) -> Vec<ScoredEntry> {
+        // Use FuturesUnordered to run per-shard similarity concurrently and
+        // append results as each shard finishes. This avoids creating a
+        // intermediate Vec<Vec<_>> and avoids mixing rayon and async.
+        let mut tasks = FuturesUnordered::new();
+
+        for locked_idx in &self.indexes {
+            let locked_idx = Arc::clone(locked_idx);
+            let token_fq = token_fq;
+            let algorithm = algorithm;
+            tasks.push(async move {
+                let idx = locked_idx.read().await;
+                let id = idx.id;
+                idx.vectorizer
+                    .similarity_uncheck_idf(token_fq, algorithm)
+                    .list
+                    .into_iter()
+                    .map(|hit| ScoredEntry {
+                        key: hit.0,
+                        score: hit.1,
+                        length: hit.2,
+                        index_id: id,
+                    })
+                    .collect::<Vec<ScoredEntry>>()
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(mut shard_res) = tasks.next().await {
+            // append shard results; using append avoids reallocating per-item
+            results.append(&mut shard_res);
+        }
+
+        results
     }
 
     pub fn sort_by_score(&self, mut results: Vec<ScoredEntry>) -> Vec<ScoredEntry> {
@@ -107,7 +116,7 @@ impl IndexPool {
     /// * `tag_exclusive` - Whether to use exclusive tag filtering
     /// # Returns
     /// Vector of ResEntry
-    pub fn generate_results(&self, results: Vec<ScoredEntry>, range: Range<usize>, tag: Tags, tag_exclusive: bool) -> Vec<ResEntry> {
+    pub async fn generate_results(&self, results: Vec<ScoredEntry>, range: Range<usize>, tag: Tags, tag_exclusive: bool) -> Vec<ResEntry> {
         let mut res_entries = Vec::new();
         let range_results: &[ScoredEntry] = {
             let len = results.len();
@@ -124,13 +133,7 @@ impl IndexPool {
                 Some(idx) => idx,
                 None => continue,
             };
-            let index_read = match index.read() {
-                Ok(r) => r,
-                Err(_poison) => {
-                    warn!("RwLock poisoned for index id {}, skipping", scored.index_id);
-                    continue; // Skip poisoned lock
-                }
-            };
+            let index_read = index.read().await;
             let meta = match index_read.meta_from_id(scored.key) {
                 Some(m) => m,
                 None => continue,
@@ -176,7 +179,7 @@ impl IndexPool {
     /// CALCULATE_BIN_SIZE_INTERVAL ごとにバイナリサイズを再計算し、SAVE_FILE_INTERVAL ごとにディスクに保存します
     /// もっとも負荷の低いシャードに追加されます
     /// 既存のURLがあれば上書きされます
-    pub fn add_document(&self,
+    pub async fn add_document(&self,
         token_fq: &TokenFrequency,
         mut meta: IndexMeta,
     ) -> Option<bool> {
@@ -188,133 +191,111 @@ impl IndexPool {
         // 最小サイズシャード選択用 (初期は最大値)
         let mut best_size: u64 = u64::MAX;
         for index in &self.indexes {
-            match index.read() {
-            Ok(idx) => {
-                if is_new {
-                if let Some(m) = idx.meta_from_url(&url) {
-                    shard_id = idx.id;
-                    doc_id = m.id;
-                    is_new = false;
-                    break;
+            match index.try_read() {
+                Ok(idx) => {
+                    if is_new {
+                        if let Some(m) = idx.meta_from_url(&url) {
+                            shard_id = idx.id;
+                            doc_id = m.id;
+                            is_new = false;
+                            break;
+                        }
+                    }
+                    // 未登録なら最もサイズの小さいシャードへ
+                    let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
+                    if size <= best_size {
+                        best_size = size;
+                        shard_id = idx.id;
+                    }
                 }
+                Err(_e) => {
+                    warn!("RwLock locked or unavailable, skipping");
+                    continue;
                 }
-                // 未登録なら最もサイズの小さいシャードへ
-                let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
-                if size <= best_size {
-                best_size = size;
-                shard_id = idx.id;
-                }
-            }
-            Err(_poison) => {
-                warn!("RwLock poisoned, skipping");
-                continue;
-            }
             }
         }
         let do_save;
         let do_calculate_size ;
         if is_new {
             // 新規登録
-            if let Ok(mut idx) = self.indexes[shard_id].write() {
-                doc_id = idx.generate_next_id();
-                idx.vectorizer.add_doc(doc_id, token_fq);
-                idx.vectorizer.update_idf();
-                meta.id = doc_id;
-                idx.meta.push(meta);
-                do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
-                do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
-                idx.update_count += 1;
-                self.counter.fetch_add(1, Ordering::SeqCst);
-            } else {
-                error!("RwLock poisoned for index id {}, skipping", shard_id);
-                return None;
-            }
+            let mut idx = self.indexes[shard_id].write().await;
+            doc_id = idx.generate_next_id();
+            idx.vectorizer.add_doc(doc_id, token_fq);
+            idx.vectorizer.update_idf();
+            meta.id = doc_id;
+            idx.meta.push(meta);
+            do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
+            do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
+            idx.update_count += 1;
+            self.counter.fetch_add(1, Ordering::SeqCst);
         } else {
             // 既存を削除してから再登録
-            if let Ok(mut idx) = self.indexes[shard_id].write() {
-                idx.vectorizer.del_doc(&doc_id);
-                idx.vectorizer.add_doc(doc_id, token_fq);
-                idx.vectorizer.update_idf();
-                idx.meta_from_id_mut(doc_id).map(|m| {
-                    m.url = meta.url.clone();
-                    m.title = meta.title.clone();
-                    m.favicon = meta.favicon.clone();
-                    m.tags = meta.tags.clone();
-                    m.description = meta.description.clone();
-                    m.points = meta.points;
-                    m.time = meta.time;
-                });
-                do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
-                do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
-                idx.update_count += 1;
-            } else {
-                error!("RwLock poisoned for index id {}, skipping", shard_id);
-                return None;
-            }
+            let mut idx = self.indexes[shard_id].write().await;
+            idx.vectorizer.del_doc(&doc_id);
+            idx.vectorizer.add_doc(doc_id, token_fq);
+            idx.vectorizer.update_idf();
+            idx.meta_from_id_mut(doc_id).map(|m| {
+                m.url = meta.url.clone();
+                m.title = meta.title.clone();
+                m.favicon = meta.favicon.clone();
+                m.tags = meta.tags.clone();
+                m.description = meta.description.clone();
+                m.points = meta.points;
+                m.time = meta.time;
+            });
+            do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
+            do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
+            idx.update_count += 1;
         }
 
         if do_save {
             // Save the index to disk
-            if let Ok(bin_size) = self.save_shard(shard_id, &self.index_dir) {
-                if let Ok(mut idx) = self.indexes[shard_id].write() {
-                    idx.vectorizer_bin_size = bin_size.0;
-                    idx.meta_bin_size = bin_size.1;
-                }
+            if let Ok(bin_size) = self.save_shard(shard_id, &self.index_dir).await {
+                let mut idx = self.indexes[shard_id].write().await;
+                idx.vectorizer_bin_size = bin_size.0;
+                idx.meta_bin_size = bin_size.1;
             }
         } else if do_calculate_size {
             // Just calculate the binary size
-            if let Ok(bin_size) = self.calculate_shard_size(shard_id) {
-                if let Ok(mut idx) = self.indexes[shard_id].write() {
-                    idx.vectorizer_bin_size = bin_size.0;
-                    idx.meta_bin_size = bin_size.1;
-                }
+            if let Ok(bin_size) = self.calculate_shard_size(shard_id).await {
+                let mut idx = self.indexes[shard_id].write().await;
+                idx.vectorizer_bin_size = bin_size.0;
+                idx.meta_bin_size = bin_size.1;
             }
         }
 
         Some(is_new)
     }
 
-    pub fn del_document(&self, url: &str) -> bool {
+    pub async fn del_document(&self, url: &str) -> bool {
         let mut found = false;
         let mut shard_id = 0;
         let mut doc_id = 0;
         // 既存で登録されているかチェック
         for index in &self.indexes {
-            match index.read() {
-                Ok(idx) => {
-                    if let Some(meta) = idx.meta_from_url(url) {
-                        // 既に登録されている
-                        shard_id = idx.id;
-                        doc_id = meta.id;
-                        found = true;
-                        break;
-                    }
-                }
-                Err(_poison) => {
-                    warn!("RwLock poisoned, skipping");
-                    continue; // Skip poisoned lock
-                }
+            let idx = index.read().await;
+            if let Some(meta) = idx.meta_from_url(url) {
+                shard_id = idx.id;
+                doc_id = meta.id;
+                found = true;
+                break;
             }
         }
         if found {
-            if let Ok(mut idx) = self.indexes[shard_id].write() {
-                idx.vectorizer.del_doc(&doc_id);
-                idx.vectorizer.update_idf();
-                // metaは先所しない、 削除するロジックにしたら多少ファイルサイズ小さくなるかもだけどlock延長のほうが悪いとおもうので
-                // idx.meta.retain(|m| m.id != doc_id);
-                idx.update_count += 1;
-                self.counter.fetch_sub(1, Ordering::SeqCst);
-            } else {
-                error!("RwLock poisoned for index id {}, skipping", shard_id);
-                return false;
-            }
+            let mut idx = self.indexes[shard_id].write().await;
+            idx.vectorizer.del_doc(&doc_id);
+            idx.vectorizer.update_idf();
+            // metaは先所しない、 削除するロジックにしたら多少ファイルサイズ小さくなるかもだけどlock延長のほうが悪いとおもうので
+            // idx.meta.retain(|m| m.id != doc_id);
+            idx.update_count += 1;
+            self.counter.fetch_sub(1, Ordering::SeqCst);
         }
         found
     }
 
     /// Load indexes and corpus from the specified directory
     /// if not found corpus, create new instance
-    pub fn load_or_new(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load_or_new(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         match Self::load(path) {
             Ok(pool) => Ok(pool),
             Err(e) => {
@@ -325,7 +306,7 @@ impl IndexPool {
     }
 
     /// Load indexes and corpus from the specified directory
-    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // .corpus
         let corpus_path = std::fs::read_dir(path)?
             .filter_map(|entry| {
@@ -468,7 +449,7 @@ impl IndexPool {
     }
 
     /// Save indexes and corpus to the specified directory
-    pub fn save(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn save(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(path)?;
 
         // Save corpus
@@ -478,10 +459,7 @@ impl IndexPool {
 
         // Save each index and meta
         for entry in self.indexes.iter() {
-            let index = entry.read().map_err(|e| {
-                log::error!("Failed to acquire read lock for index: {}", e);
-                Box::new(Error::new(std::io::ErrorKind::Other, "RwLock poisoned"))
-            })?;
+            let index = entry.read().await;
             let index_path = std::path::Path::new(path).join(format!("{}.index", index.id));
             let meta_path = std::path::Path::new(path).join(format!("{}.meta", index.id));
 
@@ -502,7 +480,7 @@ impl IndexPool {
     /// # Returns
     /// Ok((u64, u64)) or Err
     /// u64: vectorizer size, u64: meta size
-    pub fn save_shard(&self, shard_id: usize, path: &str) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    pub async fn save_shard(&self, shard_id: usize, path: &str) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(path)?;
 
         // Save corpus
@@ -513,10 +491,7 @@ impl IndexPool {
 
         // Save specified index and meta
         if let Some(entry) = self.indexes.get(shard_id) {
-            let index = entry.read().map_err(|e| {
-                log::error!("Failed to acquire read lock for index: {}", e);
-                Box::new(Error::new(std::io::ErrorKind::Other, "RwLock poisoned"))
-            })?;
+            let index = entry.read().await;
 
             // Save vectorizer
             let index_path = std::path::Path::new(path).join(format!("{}.index", index.id));
@@ -539,14 +514,10 @@ impl IndexPool {
             return Err(Box::new(Error::new(std::io::ErrorKind::NotFound, "Index shard not found")));
         }
     }
-
-    pub fn calculate_shard_size(&self, shard_id: usize) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    pub async fn calculate_shard_size(&self, shard_id: usize) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         // Just calculate the binary size of the specified shard
         if let Some(entry) = self.indexes.get(shard_id) {
-            let index = entry.read().map_err(|e| {
-                log::error!("Failed to acquire read lock for index: {}", e);
-                Box::new(Error::new(std::io::ErrorKind::Other, "RwLock poisoned"))
-            })?;
+            let index = entry.read().await;
 
             let vectorizer_bin_size = bincode::serialized_size(&index.vectorizer)?;
             let meta_bin_size = bincode::serialized_size(&index.meta)?;

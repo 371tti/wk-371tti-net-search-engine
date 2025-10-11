@@ -42,7 +42,7 @@ async fn main() {
             .is_ok()
         {
             log::info!("Ctrl+C detected. Flushing index to disk...");
-            context_clone.index_pool.save(INDEX_DIR).unwrap_or_else(|e| {
+            context_clone.index_pool.save(INDEX_DIR).await.unwrap_or_else(|e| {
                 log::error!("Index save failed: {}", e);
             });
             log::info!("Shutdown complete.");
@@ -144,7 +144,7 @@ async fn main() {
 
                 let token_fq = TokenFrequency::from(&tokens[..]);
 
-                c.c.index_pool.add_document(&token_fq, meta.clone());
+                let _is_success = c.c.index_pool.add_document(&token_fq, meta.clone()).await;
                 info!("Added URL: {}", meta.url);
                 let result = IndexRes::Success { 
                     url: meta.url, 
@@ -176,7 +176,7 @@ async fn main() {
             full_path
         };
 
-        let success = c.c.index_pool.del_document(del_part);
+        let success = c.c.index_pool.del_document(del_part).await;
 
         if success {
             let result = serde_json::json!({
@@ -272,10 +272,10 @@ async fn main() {
         let tf = TokenFrequency::from(&tokens[..]);
 
         // IndexPool を使ってスコア計算
-        let scored = c.c.index_pool.per_similarity(&tf, &algo);
+        let scored = c.c.index_pool.per_similarity(&tf, &algo).await;
         println!("Scored {} documents", scored.len());
         let sorted = c.c.index_pool.sort_by_score(scored);
-        let results = c.c.index_pool.generate_results(sorted, range.clone(), tags, tag_exclusive);
+        let results = c.c.index_pool.generate_results(sorted, range.clone(), tags, tag_exclusive).await;
         let result = SearchRes::Success { 
             query: query_str, 
             tokenize_query: tokens, 
