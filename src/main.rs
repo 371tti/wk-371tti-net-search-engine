@@ -345,8 +345,7 @@ fn parse_algo(s: &str) -> SimilarityAlgorithm {
         SimilarityAlgorithm::CosineSimilarity
     } else {
         // 既定
-        SimilarityAlgorithm::BM25(1.2, 0.75)
-    }
+        SimilarityAlgorithm::CosineSimilarity
 }
 
 // range クエリ文字列を正規化して (start, end) (endは排他的) を返す
