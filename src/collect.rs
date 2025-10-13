@@ -3,6 +3,8 @@ use std::ops::Range;
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
 
+use crate::index::IndexMeta;
+
 pub struct ScoredEntry {
     pub score: f64,
     pub key: usize,
@@ -72,6 +74,24 @@ pub enum IndexRes {
         favicon: Option<Box<str>>,
         tags: Vec<Box<str>>,
         descriptions: Box<str>,
+    },
+    #[serde(rename = "false")]
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MetaReq {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "success")]
+pub enum MetaRes {
+    #[serde(rename = "true")]
+    Success {
+        meta: IndexMeta,
     },
     #[serde(rename = "false")]
     Failed {

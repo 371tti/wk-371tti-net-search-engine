@@ -8,7 +8,7 @@ mod index;
 use kurosabi::Kurosabi;
 use log::{debug, info, warn, LevelFilter};
 use tokio::signal;
-use crate::{collect::{IndexReq, IndexRes, ScraperResult, SearchRes}, context::SearchContext, index::{IndexMeta, Tags}, http_client::fetch_scraper_api};
+use crate::{collect::{IndexReq, IndexRes, MetaReq, MetaRes, ScraperResult, SearchRes}, context::SearchContext, http_client::fetch_scraper_api, index::{IndexMeta, Tags}};
 use std::{io::Write, sync::atomic::{AtomicBool, Ordering}};
 use percent_encoding::percent_decode_str;
 use tf_idf_vectorizer::{SimilarityAlgorithm, TokenFrequency};
@@ -66,6 +66,37 @@ async fn main() {
         c
     });
 
+    kurosabi.post("/meta", |mut c| async move {
+        let meta_req = match c.req.body_de_struct::<MetaReq>().await {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("Missing or invalid request body");
+                let result = MetaRes::Failed { error: "Invalid request body".to_string() };
+                c.res.json_value(&serde_json::to_value(&result).unwrap());
+                c.res.set_status(400);
+                return c;
+            },
+        };
+
+        let url = meta_req.url;
+        let meta = match c.c.index_pool.get_meta(&url).await {
+            Some(m) => m,
+            None => {
+                let result = MetaRes::Failed { error: "Document not found".to_string() };
+                c.res.json_value(&serde_json::to_value(&result).unwrap());
+                c.res.set_status(404);
+                return c;
+            }
+        };
+
+        let result = MetaRes::Success {
+            meta,
+        };
+        c.res.json_value(&serde_json::to_value(&result).unwrap());
+        c.res.set_status(200);
+        c
+    });
+
     kurosabi.post("/add", |mut c| async move {
         let index_req = match c.req.body_de_struct::<IndexReq>().await {
             Ok(v) => v,
@@ -118,8 +149,20 @@ async fn main() {
                 let lang = results.lang.first().map(|s| s.clone().into_boxed_str());
                 let links = results.links.into_iter().map(|v| v.into_boxed_str()).collect();
 
+                let (tokens, token_sum) = match c.c.sudachi_tokenizer.mix_doc_tokenizer(&body) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("sudachi_tokenize_large error: {}", e);
+                        let result = IndexRes::Failed { error: format!("Tokenization error: {}", e) };
+                        c.res.json_value(&serde_json::to_value(&result).unwrap());
+                        c.res.set_status(500);
+                        return c;
+                    }
+                };
+
                 let meta = IndexMeta { 
                     id: 0, 
+                    token_sum,
                     url, 
                     title, 
                     description, 
@@ -129,17 +172,6 @@ async fn main() {
                     points: 0.0, 
                     tags,
                     links
-                };
-
-                let tokens = match c.c.sudachi_tokenizer.mix_doc_tokenizer(&body) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("sudachi_tokenize_large error: {}", e);
-                        let result = IndexRes::Failed { error: format!("Tokenization error: {}", e) };
-                        c.res.json_value(&serde_json::to_value(&result).unwrap());
-                        c.res.set_status(500);
-                        return c;
-                    }
                 };
 
                 let token_fq = TokenFrequency::from(&tokens[..]);
@@ -343,9 +375,16 @@ fn parse_algo(s: &str) -> SimilarityAlgorithm {
         SimilarityAlgorithm::Dot
     } else if lower.starts_with("cosine") || lower.starts_with("cosinesimilarity") {
         SimilarityAlgorithm::CosineSimilarity
+    } else if lower.starts_with("bm25") {
+        // BM25(k1, b) の形式を受け取る。引数が省略された場合は既定値を使う。
+        let vals = nums(&lower);
+        let k1 = vals.get(0).copied().unwrap_or(1.2);
+        let b = vals.get(1).copied().unwrap_or(0.75);
+        SimilarityAlgorithm::BM25(k1, b)
     } else {
         // 既定
-        SimilarityAlgorithm::CosineSimilarity
+        SimilarityAlgorithm::BM25(1.2, 0.75)
+    }
 }
 
 // range クエリ文字列を正規化して (start, end) (endは排他的) を返す

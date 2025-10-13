@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::io::Error;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock, TryLockError};
 
-use log::warn;
+use log::{warn, error};
 use rayon::prelude::*;
 use chrono::{DateTime, Utc};
 use tf_idf_vectorizer::{Corpus, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
 use serde::{Serialize, Deserialize};
+use tokio::task::spawn_blocking;
 
 use crate::collect::{ResEntry, ScoredEntry};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -62,35 +62,44 @@ impl IndexPool {
     /// }
     /// ```
     pub async fn per_similarity(&self, token_fq: &TokenFrequency, algorithm: &SimilarityAlgorithm) -> Vec<ScoredEntry> {
-        // Use FuturesUnordered to run per-shard similarity concurrently and
-        // append results as each shard finishes. This avoids creating a
-        // intermediate Vec<Vec<_>> and avoids mixing rayon and async.
-        let mut tasks = FuturesUnordered::new();
-
-        for locked_idx in &self.indexes {
-            let locked_idx = Arc::clone(locked_idx);
-            let token_fq = token_fq;
-            let algorithm = algorithm;
-            tasks.push(async move {
-                let idx = locked_idx.read().await;
-                let id = idx.id;
-                idx.vectorizer
-                    .similarity_uncheck_idf(token_fq, algorithm)
-                    .list
-                    .into_iter()
-                    .map(|hit| ScoredEntry {
-                        key: hit.0,
-                        score: hit.1,
-                        length: hit.2,
-                        index_id: id,
-                    })
-                    .collect::<Vec<ScoredEntry>>()
-            });
-        }
+        let mut tasks = self.indexes.iter()
+            .map(|arc_lock| { Arc::clone(arc_lock) })
+            .map(|locked_idx| {
+                let token_fq = token_fq.clone();
+                let algorithm = algorithm.clone();
+                async move {
+                    spawn_blocking(move || {
+                        let idx = match locked_idx.try_read() {
+                            Ok(i) => i,
+                            Err(e) => match e {
+                                TryLockError::WouldBlock => {
+                                    warn!("RwLock would block, skipping");
+                                    return Vec::new();
+                                }
+                                TryLockError::Poisoned(e) => {
+                                    error!("RwLock poisoned: {}", e);
+                                    return Vec::new();
+                                }
+                            }
+                        };
+                        let id = idx.id;
+                        idx.vectorizer
+                            .similarity_uncheck_idf(&token_fq, &algorithm)
+                            .list
+                            .into_iter()
+                            .map(|hit| ScoredEntry {
+                                key: hit.0,
+                                score: hit.1,
+                                length: hit.2,
+                                index_id: id,
+                            })
+                            .collect::<Vec<ScoredEntry>>()
+                    }).await.unwrap_or_else(|_| Vec::new())
+                }
+            }).collect::<FuturesUnordered<_>>();
 
         let mut results = Vec::new();
         while let Some(mut shard_res) = tasks.next().await {
-            // append shard results; using append avoids reallocating per-item
             results.append(&mut shard_res);
         }
 
@@ -118,46 +127,60 @@ impl IndexPool {
     /// Vector of ResEntry
     pub async fn generate_results(&self, results: Vec<ScoredEntry>, range: Range<usize>, tag: Tags, tag_exclusive: bool) -> Vec<ResEntry> {
         let mut res_entries = Vec::new();
-        let range_results: &[ScoredEntry] = {
-            let len = results.len();
-            let start = range.start.min(len);
-            let end = range.end.min(len);
-            if start >= end {
-            &[]
-            } else {
-            &results[start..end]
-            }
-        };
-        for scored in range_results {
+        let mut counter = 0usize;
+        for scored in results.iter() {
             let index = match self.indexes.get(scored.index_id) {
                 Some(idx) => idx,
                 None => continue,
             };
-            let index_read = index.read().await;
-            let meta = match index_read.meta_from_id(scored.key) {
-                Some(m) => m,
+
+            let guard = match index.try_read() {
+                Ok(g) => g,
+                Err(e) => match e {
+                    TryLockError::WouldBlock => {
+                        warn!("RwLock would block, skipping");
+                        continue;
+                    }
+                    TryLockError::Poisoned(e) => {
+                        error!("RwLock poisoned: {}", e);
+                        continue;
+                    }
+                },
+            };
+
+            let meta_opt = guard.meta_from_id(scored.key);
+            let meta = match meta_opt {
+                Some(m) => m.clone(),
                 None => continue,
             };
+            drop(guard);
+
+            let tags = meta.tags;
+
             // タグフィルタリング
-            // example: tag_exclusive = true -> 完全一致, false -> 部分一致
-            // タグ指定が空でなければフィルタ
             if !tag.is_empty() {
                 if tag_exclusive {
-                    if !meta.tags.is_filter_contains(tag) {
+                    if !tags.is_filter_contains(tag) {
                         continue;
                     }
                 } else {
-                    if !meta.tags.contains(tag) {
+                    if !tags.contains(tag) {
                         continue;
                     }
                 }
             }
+
+            counter += 1;
+            if counter <= range.start {
+                continue;
+            }
+
             res_entries.push(ResEntry {
-                url: meta.url.clone(),
-                title: meta.title.clone(),
-                favicon: meta.favicon.clone(),
-                tags: meta.tags.tags(),
-                descriptions: meta.description.clone(),
+                url: meta.url,
+                title: meta.title,
+                favicon: meta.favicon,
+                tags: tags.tags(),
+                descriptions: meta.description,
                 score: scored.score,
                 point: meta.points,
                 length: scored.length,
@@ -165,8 +188,33 @@ impl IndexPool {
                 index_id: scored.index_id,
                 time: meta.time,
             });
+            if res_entries.len() >= range.len() {
+                break;
+            }
         }
         res_entries
+    }
+
+    pub async fn get_meta(&self, url: &str) -> Option<IndexMeta> {
+        for index in &self.indexes {
+            let guard = match index.try_read() {
+                Ok(g) => g,
+                Err(e) => match e {
+                    TryLockError::WouldBlock => {
+                        warn!("RwLock would block, skipping");
+                        continue;
+                    }
+                    TryLockError::Poisoned(e) => {
+                        error!("RwLock poisoned: {}", e);
+                        continue;
+                    }
+                },
+            };
+            if let Some(meta) = guard.meta_from_url(url) {
+                return Some(meta.clone());
+            }
+        }
+        None
     }
 
     /// add document to index pool
@@ -218,9 +266,19 @@ impl IndexPool {
         let do_calculate_size ;
         if is_new {
             // 新規登録
-            let mut idx = self.indexes[shard_id].write().await;
+            let mut idx = match self.indexes[shard_id].write() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("RwLock poisoned: {}", e);
+                    return None;
+                },
+            };
             doc_id = idx.generate_next_id();
             idx.vectorizer.add_doc(doc_id, token_fq);
+            // token_sumを強引に調整(複数のtokenizerを通している場合に合わなくなるため これでc_tokensについては正確になる)
+            idx.vectorizer.documents.get_mut(doc_id).map(|d| {
+                d.token_sum = meta.token_sum;
+            });
             idx.vectorizer.update_idf();
             meta.id = doc_id;
             idx.meta.push(meta);
@@ -230,9 +288,19 @@ impl IndexPool {
             self.counter.fetch_add(1, Ordering::SeqCst);
         } else {
             // 既存を削除してから再登録
-            let mut idx = self.indexes[shard_id].write().await;
+            let mut idx = match self.indexes[shard_id].write() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("RwLock poisoned: {}", e);
+                    return None;
+                },
+            };
             idx.vectorizer.del_doc(&doc_id);
             idx.vectorizer.add_doc(doc_id, token_fq);
+            // token_sumを強引に調整(複数のtokenizerを通している場合に合わなくなるため これでc_tokensについては正確になる)
+            idx.vectorizer.documents.get_mut(doc_id).map(|d| {
+                d.token_sum = meta.token_sum;
+            });
             idx.vectorizer.update_idf();
             idx.meta_from_id_mut(doc_id).map(|m| {
                 m.url = meta.url.clone();
@@ -242,6 +310,9 @@ impl IndexPool {
                 m.description = meta.description.clone();
                 m.points = meta.points;
                 m.time = meta.time;
+                m.lang = meta.lang.clone();
+                m.links = meta.links.clone();
+                m.token_sum = meta.token_sum;
             });
             do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
             do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
@@ -251,14 +322,26 @@ impl IndexPool {
         if do_save {
             // Save the index to disk
             if let Ok(bin_size) = self.save_shard(shard_id, &self.index_dir).await {
-                let mut idx = self.indexes[shard_id].write().await;
+                let mut idx = match self.indexes[shard_id].write() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        error!("RwLock poisoned: {}", e);
+                        return None;
+                    },
+                };
                 idx.vectorizer_bin_size = bin_size.0;
                 idx.meta_bin_size = bin_size.1;
             }
         } else if do_calculate_size {
             // Just calculate the binary size
             if let Ok(bin_size) = self.calculate_shard_size(shard_id).await {
-                let mut idx = self.indexes[shard_id].write().await;
+                let mut idx = match self.indexes[shard_id].write() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        error!("RwLock poisoned: {}", e);
+                        return None;
+                    },
+                };
                 idx.vectorizer_bin_size = bin_size.0;
                 idx.meta_bin_size = bin_size.1;
             }
@@ -273,7 +356,13 @@ impl IndexPool {
         let mut doc_id = 0;
         // 既存で登録されているかチェック
         for index in &self.indexes {
-            let idx = index.read().await;
+            let idx = match index.read() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("RwLock poisoned: {}", e);
+                    continue;
+                }
+            };
             if let Some(meta) = idx.meta_from_url(url) {
                 shard_id = idx.id;
                 doc_id = meta.id;
@@ -282,7 +371,13 @@ impl IndexPool {
             }
         }
         if found {
-            let mut idx = self.indexes[shard_id].write().await;
+            let mut idx = match self.indexes[shard_id].write() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("RwLock poisoned: {}", e);
+                    return false;
+                },
+            };
             idx.vectorizer.del_doc(&doc_id);
             idx.vectorizer.update_idf();
             // metaは先所しない、 削除するロジックにしたら多少ファイルサイズ小さくなるかもだけどlock延長のほうが悪いとおもうので
@@ -459,7 +554,13 @@ impl IndexPool {
 
         // Save each index and meta
         for entry in self.indexes.iter() {
-            let index = entry.read().await;
+            let index = match entry.read() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("RwLock poisoned: {}", e);
+                    continue;
+                },
+            };
             let index_path = std::path::Path::new(path).join(format!("{}.index", index.id));
             let meta_path = std::path::Path::new(path).join(format!("{}.meta", index.id));
 
@@ -491,7 +592,13 @@ impl IndexPool {
 
         // Save specified index and meta
         if let Some(entry) = self.indexes.get(shard_id) {
-            let index = entry.read().await;
+            let index = match entry.read() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("RwLock poisoned: {}", e);
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "RwLock poisoned").into());
+                },
+            };
 
             // Save vectorizer
             let index_path = std::path::Path::new(path).join(format!("{}.index", index.id));
@@ -517,7 +624,13 @@ impl IndexPool {
     pub async fn calculate_shard_size(&self, shard_id: usize) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         // Just calculate the binary size of the specified shard
         if let Some(entry) = self.indexes.get(shard_id) {
-            let index = entry.read().await;
+            let index = match entry.read() {
+                Ok(i) => i,
+                Err(e) => {
+                    error!("RwLock poisoned: {}", e);
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "RwLock poisoned").into());
+                },
+            };
 
             let vectorizer_bin_size = bincode::serialized_size(&index.vectorizer)?;
             let meta_bin_size = bincode::serialized_size(&index.meta)?;
@@ -605,6 +718,8 @@ impl Index {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexMeta {
     pub id: usize,
+    /// token_sum
+    pub token_sum: u64,
     /// URL
     /// only URL is used for Hash and Equal
     pub url: Box<str>,
