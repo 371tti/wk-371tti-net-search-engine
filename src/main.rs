@@ -66,6 +66,11 @@ async fn main() {
         c
     });
 
+    kurosabi.get("/ping", |mut c| async move {
+        c.res.text("pong");
+        c
+    });
+
     kurosabi.post("/meta", |mut c| async move {
         let meta_req = match c.req.body_de_struct::<MetaReq>().await {
             Ok(v) => v,
