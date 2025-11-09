@@ -87,10 +87,10 @@ impl SudachiTokenizer {
         Ok(Tokenized { result: aggregated })
     }
 
-    pub fn pure_doc_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error + Send + Sync>> {
-        let c = self.tokenize(text, Mode::C)?;
-        Ok(c.tokens())
-    }
+    // pub fn pure_doc_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error + Send + Sync>> {
+    //     let c = self.tokenize(text, Mode::C)?;
+    //     Ok(c.tokens())
+    // }
 
     pub fn mix_doc_tokenizer(&self, text: &str) -> Result<(Vec<Box<str>>, u64), Box<dyn std::error::Error + Send + Sync>> {
         let c = self.tokenize(text, Mode::C)?;
@@ -111,10 +111,10 @@ impl SudachiTokenizer {
         Ok((synthetic_tokens, token_sum as u64))
     }
 
-    pub fn pure_query_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error + Send + Sync>> {
-        let c = self.tokenize(text, Mode::C)?;
-        Ok(c.normalized_tokens())
-    }
+    // pub fn pure_query_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error + Send + Sync>> {
+    //     let c = self.tokenize(text, Mode::C)?;
+    //     Ok(c.normalized_tokens())
+    // }
 
     pub fn mix_query_tokenizer(&self, text: &str) -> Result<Vec<Box<str>>, Box<dyn std::error::Error + Send + Sync>> {
         let c = self.tokenize(text, Mode::C)?;
@@ -133,6 +133,7 @@ impl SudachiTokenizer {
         let synthetic_tokens: Vec<Box<str>> = c_tokens.into_iter()
             .chain(c_tokens_sub.into_iter())
             .chain(a_speech_tokens.into_iter())
+            .chain(a_2gram_tokens.into_iter())
             .collect();
         Ok(synthetic_tokens)
     }
@@ -143,15 +144,15 @@ pub struct Tokenized {
 }
 
 impl Tokenized {
-    pub fn normalized_tokens(&self) -> Vec<Box<str>> {
-        self.result
-            .iter().flat_map(|m| {
-                m.iter()
-                    .map(|s| s.normalized_form().trim_matches(&[' ', '　']).to_string().into_boxed_str())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<Box<str>>>()
-            }).collect::<Vec<Box<str>>>()
-    }
+    // pub fn normalized_tokens(&self) -> Vec<Box<str>> {
+    //     self.result
+    //         .iter().flat_map(|m| {
+    //             m.iter()
+    //                 .map(|s| s.normalized_form().trim_matches(&[' ', '　']).to_string().into_boxed_str())
+    //                 .filter(|s| !s.is_empty())
+    //                 .collect::<Vec<Box<str>>>()
+    //         }).collect::<Vec<Box<str>>>()
+    // }
 
     pub fn tokens(&self) -> Vec<Box<str>> {
         self.result

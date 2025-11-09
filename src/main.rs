@@ -14,7 +14,7 @@ use percent_encoding::percent_decode_str;
 use tf_idf_vectorizer::{SimilarityAlgorithm, TokenFrequency};
 
 pub const INDEX_DIR: &str = "./index_data";
-pub const SCRAPER_API_URL: &str = "http://localhost:88/url/";
+pub const SCRAPER_API_URL: &str = "http://192.168.0.81/scraping?url=";
 pub const MAX_DESC_LENGTH: usize = 200; // 説明文の最大長
 pub const MAX_TITLE_LENGTH: usize = 100; // タイトルの最大長
 pub const MAX_SEARCH_RESULTS: usize = 1000; // 検索結果の最大数
@@ -127,18 +127,9 @@ async fn main() {
 
         match scraper_result {
             ScraperResult::Success { results, status: _, url, success: _ } => {
-                let body = match results.descriptions.first() {
-                    Some(d) => d,
-                    None => {
-                        warn!("No body text found");
-                        let result = IndexRes::Failed { error: "No body text found".to_string() };
-                        c.res.json_value(&serde_json::to_value(&result).unwrap());
-                        c.res.set_status(404);
-                        return c;
-                    }
-                };
+                let body = results.text;
 
-                let title = match index_req.title.or_else(|| results.title.first().cloned()) {
+                let title = match index_req.title.or_else(|| results.title) {
                     Some(t) => t,
                     None => "No Title".to_string(),
                 }.chars().take(MAX_TITLE_LENGTH).collect();
@@ -148,10 +139,10 @@ async fn main() {
                     None => body.chars().take(MAX_DESC_LENGTH).collect(), // 先頭500文字を説明に
                 };
                 
-                let favicon: Option<Box<str>> = index_req.favicon.or_else(|| results.favicon.first().cloned()).map(|s| s.into_boxed_str());
+                let favicon: Option<Box<str>> = index_req.favicon.or_else(|| results.favicon ).map(|s| s.into_boxed_str());
                 let url = url.into_boxed_str();
                 let tags = Tags::from_strs(&index_req.tags);
-                let lang = results.lang.first().map(|s| s.clone().into_boxed_str());
+                let lang = results.lang.map(|s| s.clone().into_boxed_str());
                 let links = results.links.into_iter().map(|v| v.into_boxed_str()).collect();
 
                 let (tokens, token_sum) = match c.c.sudachi_tokenizer.mix_doc_tokenizer(&body) {

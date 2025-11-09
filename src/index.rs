@@ -4,8 +4,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, TryLockError};
 
-use log::{warn, error};
-use rayon::prelude::*;
+use log::{error, info, warn};
 use chrono::{DateTime, Utc};
 use tf_idf_vectorizer::{Corpus, SimilarityAlgorithm, TFIDFData, TFIDFVectorizer, TokenFrequency};
 use serde::{Serialize, Deserialize};
@@ -107,12 +106,6 @@ impl IndexPool {
     }
 
     pub fn sort_by_score(&self, mut results: Vec<ScoredEntry>) -> Vec<ScoredEntry> {
-        results
-            .par_iter_mut()
-            .for_each(|h| {
-                // Calculate total score for each hit
-                h.score = h.score; // Placeholder for actual score calculation if needed
-            });
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         results
     }
@@ -459,6 +452,7 @@ impl IndexPool {
             })
             .collect::<Vec<_>>();
 
+        info!("Loading corpus from {:?}", corpus_path);
         let corpus_data = match std::fs::read(corpus_path.as_path()) {
             Ok(data) => data,
             Err(e) => {
@@ -466,6 +460,7 @@ impl IndexPool {
                 return Err(Box::new(e));
             }
         };
+        info!("Loading indexes from {} index files", index_paths.len());
         let corpus: Arc<Corpus> = match bincode::deserialize(&corpus_data) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -474,11 +469,13 @@ impl IndexPool {
             }
         };
 
+        info!("Loading vectorizers from {} index files", index_paths.len());
         let mut vectorizer_map: HashMap<usize, TFIDFVectorizer<u16, usize>> = index_paths.iter()
             .filter_map(|path| {
                 let id = path.file_stem()
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<usize>().ok())?;
+                info!("Loading vectorizer for index id {}", id);
                 let data = match std::fs::read(path) {
                     Ok(d) => d,
                     Err(e) => {
@@ -486,6 +483,7 @@ impl IndexPool {
                         return None;
                     }
                 };
+                info!("Deserializing vectorizer for index id {}", id);
                 let index: TFIDFData<u16, usize> = match bincode::deserialize(&data) {
                     Ok(idx) => idx,
                     Err(e) => {
@@ -493,16 +491,21 @@ impl IndexPool {
                         return None;
                     }
                 };
+                info!("Done deserializing vectorizer for index id {}", id);
+                info!("Linking vectorizer to corpus for index id {}", id);
                 let vectorizer = index.into_tf_idf_vectorizer(corpus.clone());
+                info!("Done linking vectorizer to corpus for index id {}", id);
                 Some((id, vectorizer))
             })
             .collect();
 
+        info!("Loading metadata from {} meta files", meta_paths.len());
         let mut meta_map: HashMap<usize, Vec<IndexMeta>> = meta_paths.iter()
             .filter_map(|path| {
                 let id = path.file_stem()
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<usize>().ok())?;
+                info!("Loading metadata for index id {}", id);
                 let data = match std::fs::read(path) {
                     Ok(d) => d,
                     Err(e) => {
@@ -510,6 +513,7 @@ impl IndexPool {
                         return None;
                     }
                 };
+                info!("Deserializing metadata for index id {}", id);
                 let meta: Vec<IndexMeta> = match bincode::deserialize(&data) {
                     Ok(m) => m,
                     Err(e) => {
@@ -517,6 +521,7 @@ impl IndexPool {
                         return None;
                     }
                 };
+                info!("Done deserializing metadata for index id {}", id);
                 Some((id, meta))
             })
             .collect();
@@ -524,8 +529,9 @@ impl IndexPool {
         let mut indexes = Vec::with_capacity(DEFAULT_INDEX_SHARD_NUM);
 
         let mut counter: u64 = 0;
-
+        info!("Preparing indexes");
         for i in 0..DEFAULT_INDEX_SHARD_NUM {
+            info!("Preparing index shard {}", i);
             let vectorizer = vectorizer_map.remove(&i).ok_or_else(|| {
                 log::error!("No vectorizer found for index id {}", i);
                 Box::new(Error::new(std::io::ErrorKind::NotFound, "Vectorizer not found"))
@@ -536,10 +542,11 @@ impl IndexPool {
                 log::error!("No meta found for index id {}", i);
                 Box::new(Error::new(std::io::ErrorKind::NotFound, "Meta not found"))
             })?;
+            info!("Done preparing index shard {}", i);
             let meta_bin_size = bincode::serialized_size(&meta)?;
             indexes.push(Arc::new(RwLock::new(Index::with_vectorizer(i, vectorizer, meta, vectorizer_bin_size, meta_bin_size))));
         }
-
+        info!("Done loading all indexes");
         Ok(Self { corpus, indexes, index_dir: path.to_string(), counter: AtomicU64::new(counter) })
     }
 
@@ -762,11 +769,6 @@ impl Tags {
     pub const SHOPPING: u64 = 1 << 5;
     pub const ACADEMIC: u64 = 1 << 6;
     pub const TOOLS: u64 = 1 << 7;
-
-    /// eg: Tags::new(Tags::NEWS | Tags::BLOG)
-    pub fn new(set: u64) -> Self {
-        Self(set)
-    }
 
     /// すべて満たしてるか
     /// tagはselfに含まれている必要がある
