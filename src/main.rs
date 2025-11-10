@@ -6,12 +6,28 @@ mod index;
 
 
 use kurosabi::Kurosabi;
-use log::{debug, info, warn, LevelFilter};
+use log::{debug, info, warn};
 use tokio::signal;
 use crate::{collect::{IndexReq, IndexRes, MetaReq, MetaRes, ScraperResult, SearchRes}, context::SearchContext, http_client::fetch_scraper_api, index::{IndexMeta, Tags}};
-use std::{io::Write, sync::atomic::{AtomicBool, Ordering}};
+use std::sync::atomic::{AtomicBool, Ordering};
 use percent_encoding::percent_decode_str;
 use tf_idf_vectorizer::{SimilarityAlgorithm, TokenFrequency};
+
+// シンプルな URL クエリ値用パーセントエンコーダ（RFC3986 の unreserved を除いて byte を %HH に変換）
+fn percent_encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
+}
 
 pub const INDEX_DIR: &str = "./index_data";
 pub const SCRAPER_API_URL: &str = "http://192.168.0.81/scraping?url=";
@@ -25,7 +41,7 @@ static CTRL_C_SAVED: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() {
-    init_logging();
+    env_logger::try_init_from_env(env_logger::Env::default().default_filter_or("debug")).unwrap_or_else(|_| ());
     info!("Logger initialized");
     let context = SearchContext::new(INDEX_DIR);
 
@@ -114,7 +130,26 @@ async fn main() {
             },
         };
 
-        let scraper_result = match fetch_scraper_api(&format!("{}{}", SCRAPER_API_URL, index_req.url)).await {
+        // クエリパラメータとフラグメント削除
+        let url = {
+            let s = &index_req.url;
+            // フラグメント削除
+            let no_frag = s.split('#').next().unwrap_or(s);
+
+            no_frag.split("?").next().unwrap_or(no_frag).to_string()
+        };
+
+        println!("Received /add request for URL: {}", url);
+        // url をクエリ値として安全に渡すためエンコード
+        let escaped = percent_encode_query_value(&url);
+        let mut req_url = format!("{}{}", SCRAPER_API_URL, escaped);
+        if let Some(selector) = &index_req.target_selector {
+            // セレクタが指定されている場合は追加でパラメータを付与
+            req_url.push_str("&text_selector=");
+            req_url.push_str(&selector);
+        }
+        println!("Fetching from scraper API: {}", req_url);
+        let scraper_result = match fetch_scraper_api(&req_url).await {
             Ok(res) => res,
             Err(e) => {
                 warn!("Failed to fetch scraper API: {}", e);
@@ -124,9 +159,18 @@ async fn main() {
                 return c;
             }
         };
+        println!("Scraper API response received for URL: {}", url);
 
         match scraper_result {
-            ScraperResult::Success { results, status: _, url, success: _ } => {
+            ScraperResult::Success { results, status,  url: _ } => {
+                if status != 200 {
+                    warn!("Scraper API returned non-200 status: {}", status);
+                    let result = IndexRes::Failed { error: format!("Scraper API returned status: {}", status) };
+                    c.res.json_value(&serde_json::to_value(&result).unwrap());
+                    c.res.set_status(500);
+                    return c;
+                }
+
                 let body = results.text;
 
                 let title = match index_req.title.or_else(|| results.title) {
@@ -140,7 +184,7 @@ async fn main() {
                 };
                 
                 let favicon: Option<Box<str>> = index_req.favicon.or_else(|| results.favicon ).map(|s| s.into_boxed_str());
-                let url = url.into_boxed_str();
+                let url = results.url.into_boxed_str();
                 let tags = Tags::from_strs(&index_req.tags);
                 let lang = results.lang.map(|s| s.clone().into_boxed_str());
                 let links = results.links.into_iter().map(|v| v.into_boxed_str()).collect();
@@ -180,12 +224,13 @@ async fn main() {
                     favicon: meta.favicon, 
                     tags: meta.tags.tags(), 
                     descriptions: meta.description, 
+                    links: meta.links.clone(),
                 };
                 c.res.json_value(&serde_json::to_value(&result).unwrap());
                 c.res.set_status(200);
                 return c;
             }
-            ScraperResult::Failed { error , success: _ } => {
+            ScraperResult::Failed { error } => {
                 warn!("Scraper API returned error: {}", error);
                 let result = IndexRes::Failed { error: format!("Scraper API error: {}", error) };
                 c.res.json_value(&serde_json::to_value(&result).unwrap());
@@ -325,30 +370,12 @@ async fn main() {
     kurosabi
         .server()
         .port(90)
-        .thread(16)
+        .thread(32)
+        .queue_size(3000)
         .host([0,0,0,0])
         .build()
         .run_async()
         .await;
-}
-
-fn init_logging() {
-    // RUST_LOG が未設定ならデフォルトを与える
-    let has_env = std::env::var("RUST_LOG").is_ok();
-    if !has_env {
-        unsafe { std::env::set_var("RUST_LOG", "debug"); }
-    }
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
-        .format(|f, record| {
-            use chrono::Local;
-            let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            writeln!(f, "[{ts}] {lvl} {target}: {msg}",
-                lvl = record.level(),
-                target = record.target(),
-                msg = record.args())
-        })
-        .filter_level(LevelFilter::Debug)
-        .try_init();
 }
 
 // 検索アルゴリズムの簡易パーサ

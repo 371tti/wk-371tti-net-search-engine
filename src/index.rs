@@ -224,7 +224,9 @@ impl IndexPool {
         token_fq: &TokenFrequency,
         mut meta: IndexMeta,
     ) -> Option<bool> {
+
         let url = meta.url.clone();
+
         let mut is_new = true;
         let mut shard_id = 0;
         let mut doc_id = 0;
@@ -274,6 +276,15 @@ impl IndexPool {
             });
             idx.vectorizer.update_idf();
             meta.id = doc_id;
+            meta.links.iter_mut().for_each(|link| {
+                let s: &str = link.as_ref();
+                let no_frag = s.split('#').next().unwrap_or(s);
+                let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+                *link = no_query.to_string().into();
+            });
+            meta.links.sort_unstable();
+            meta.links.dedup();
+            idx.vectorizer.update_idf();
             idx.meta.push(meta);
             do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
             do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
@@ -294,6 +305,14 @@ impl IndexPool {
             idx.vectorizer.documents.get_mut(doc_id).map(|d| {
                 d.token_sum = meta.token_sum;
             });
+            meta.links.iter_mut().for_each(|link| {
+                let s: &str = link.as_ref();
+                let no_frag = s.split('#').next().unwrap_or(s);
+                let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+                *link = no_query.to_string().into();
+            });
+            meta.links.sort_unstable();
+            meta.links.dedup();
             idx.vectorizer.update_idf();
             idx.meta_from_id_mut(doc_id).map(|m| {
                 m.url = meta.url.clone();
@@ -460,7 +479,7 @@ impl IndexPool {
                 return Err(Box::new(e));
             }
         };
-        info!("Loading indexes from {} index files", index_paths.len());
+        info!("Deserializing corpus");
         let corpus: Arc<Corpus> = match bincode::deserialize(&corpus_data) {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -468,6 +487,7 @@ impl IndexPool {
                 return Err(Box::new(e));
             }
         };
+        info!("=Done deserializing corpus=\n");
 
         info!("Loading vectorizers from {} index files", index_paths.len());
         let mut vectorizer_map: HashMap<usize, TFIDFVectorizer<u16, usize>> = index_paths.iter()
@@ -498,6 +518,7 @@ impl IndexPool {
                 Some((id, vectorizer))
             })
             .collect();
+        info!("=Done loading and deserializing all vectorizers=\n");
 
         info!("Loading metadata from {} meta files", meta_paths.len());
         let mut meta_map: HashMap<usize, Vec<IndexMeta>> = meta_paths.iter()
@@ -525,6 +546,7 @@ impl IndexPool {
                 Some((id, meta))
             })
             .collect();
+        info!("=Done loading and deserializing all metadata=\n");
 
         let mut indexes = Vec::with_capacity(DEFAULT_INDEX_SHARD_NUM);
 
@@ -546,7 +568,7 @@ impl IndexPool {
             let meta_bin_size = bincode::serialized_size(&meta)?;
             indexes.push(Arc::new(RwLock::new(Index::with_vectorizer(i, vectorizer, meta, vectorizer_bin_size, meta_bin_size))));
         }
-        info!("Done loading all indexes");
+        info!("=Done loading all indexes=\n");
         Ok(Self { corpus, indexes, index_dir: path.to_string(), counter: AtomicU64::new(counter) })
     }
 

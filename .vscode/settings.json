@@ -4,5 +4,6 @@
         "SUDACHI",
         "Uncategorized"
     ],
-    "jpLsp.applyAllLanguages": false
+    "jpLsp.applyAllLanguages": false,
+    "liveServer.settings.port": 81
 }

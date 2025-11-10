@@ -25,6 +25,8 @@ BATCH_GOOD = int(os.getenv("BATCH_GOOD", "0"))
 BATCH_TOPVIEW = int(os.getenv("BATCH_TOPVIEW", "0"))
 BATCH_RANDOM = int(os.getenv("BATCH_RANDOM", "24"))
 BATCH_MAX = int(os.getenv("BATCH_MAX", "24"))
+RECURSIVE_DEPTH = int(os.getenv("RECURSIVE_DEPTH", "3"))  # デフォルトで n=2 階層まで
+LINK_SAMPLE = int(os.getenv("LINK_SAMPLE", "5"))  # ページあたりランダムに処理するリンク数の上限
 
 LOOP_SLEEP = float(os.getenv("LOOP_SLEEP", "1"))      # 1 メインループ後の待機
 SUMMARY_MAX = int(os.getenv("SUMMARY_MAX", "800"))
@@ -52,6 +54,11 @@ class RateLimiter:
 
 
 rate_limiter = RateLimiter(REQ_INTERVAL)
+
+# 最近追加した URL を一時的に記録して繰り返し送信を防ぐ (in-memory TTL)
+RECENT_ADD_TTL = int(os.getenv("ADD_TTL_SECONDS", "3600"))  # seconds
+_recently_added = {}  # url(str) -> datetime (expiry)
+_recent_lock = asyncio.Lock()
 
 
 async def http_json(session: ClientSession, url: str, params=None, timeout=30):
@@ -147,19 +154,139 @@ async def fetch_summary(session: ClientSession, title: str):
 
 
 async def post_document(session: ClientSession, url: str, title: str, extract: str):
-    payload = {
-        "url": url,
-        "title": None,
-        "favicon": None,
-        "tags": ["wiki"],
-        "descriptions": extract,
-        "target_selector": ".mw-body-content"
-    }
+    # 再帰的に add するためのラッパ
+    await add_and_recurse(session, url, title, extract, 0, RECURSIVE_DEPTH)
+
+
+async def add_and_recurse(session: ClientSession, url: str, title: str, extract: str, depth: int, max_depth: int, seen=None):
+    """
+    指定 URL を /add に投げ、レスポンスに含まれる links を再帰的に追加する。
+    非 Wikipedia ドメインは tags から "wiki" を外し、POST ボディは URL のみ送る。
+    seen は再帰中の重複防止用セット。
+    """
+    if seen is None:
+        seen = set()
+
+    # 直近に追加した URL は繰り返し送信しない
+    now_dt = datetime.utcnow()
+    # cleanup expired entries and check
+    async with _recent_lock:
+        # 削除済み/期限切れのクリーンアップ
+        expired = [k for k, v in _recently_added.items() if v <= now_dt]
+        for k in expired:
+            try:
+                del _recently_added[k]
+            except KeyError:
+                pass
+
+        exp = _recently_added.get(url)
+        if exp and exp > now_dt:
+            # 直近に追加済み -> スキップ
+            print(f"[SKIP] recently added until={exp.isoformat()} url={url}")
+            return
+
+    if url in seen:
+        return
+    seen.add(url)
+
+    # ドメイン判定
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    is_wikipedia = "wikipedia.org" in hostname
+
+    # payload 作成: wikipedia 以外は URL のみ送る
+    if is_wikipedia:
+        payload = {
+            "url": url,
+            "title": None,
+            "favicon": None,
+            "tags": ["wiki"],
+            "descriptions": extract,
+            "target_selector": ".mw-body-content"
+        }
+    else:
+        payload = {"url": url}
+
     status, text = await http_post_json(session, SEARCH_ENGINE_ADD, payload)
     if status >= 300:
         print(f"[WARN] add {status} {title[:30]} {text[:60]}")
-    else:
-        print(f"[OK] {title[:40]}")
+        return
+
+    # 正常応答: レスポンスを JSON 化して links を取り出す
+    try:
+        data = None
+        try:
+            import json
+            data = json.loads(text)
+        except Exception:
+            data = None
+        if not data:
+            print(f"[OK] {title} (no json)")
+            return
+
+        # serde の tag="success" を想定: {"success": true, ...}
+        succ = data.get("success")
+        is_success = False
+        if isinstance(succ, bool):
+            is_success = succ
+        elif isinstance(succ, str):
+            is_success = succ.lower() in ("true", "1")
+        elif isinstance(succ, (int, float)):
+            try:
+                is_success = int(succ) != 0
+            except Exception:
+                is_success = False
+
+        if is_success:
+            links = data.get("links") or []
+            # links が文字列であればリストに変換
+            if isinstance(links, str):
+                links = [links]
+            print(f"[OK] {title} links={len(links)} depth={depth}")
+            # 成功したら recent マップに登録して直近再送を防止する
+            try:
+                async with _recent_lock:
+                    _recently_added[url] = datetime.utcnow() + timedelta(seconds=RECENT_ADD_TTL)
+            except Exception:
+                # ロック失敗しても処理継続
+                pass
+            # 最大深度を超えていなければ再帰
+            if depth < max_depth:
+                # ユーザ要望: links にあった値をそのまま流す (正規化しない)
+                # ただし空文字とハッシュアンカーは除外し、ページ内重複は排除する
+                to_process_raw = []
+                seen_local = set()
+                for l in links:
+                    if not isinstance(l, str):
+                        continue
+                    s = l.strip()
+                    if not s:
+                        continue
+                    if s.startswith('#'):
+                        continue
+                    # ページ内で同じ raw リンクを繰り返さない
+                    if s in seen or s in seen_local:
+                        continue
+                    seen_local.add(s)
+                    to_process_raw.append(s)
+
+                print(f"[DEBUG] {title} raw_links={len(links)} to_process={len(to_process_raw)} depth={depth}")
+                # サンプリング
+                if LINK_SAMPLE > 0 and len(to_process_raw) > LINK_SAMPLE:
+                    try:
+                        to_process = random.sample(to_process_raw, LINK_SAMPLE)
+                    except Exception:
+                        to_process = to_process_raw[:LINK_SAMPLE]
+                else:
+                    to_process = to_process_raw
+
+                for l in to_process:
+                    await add_and_recurse(session, l, l, "", depth + 1, max_depth, seen)
+        else:
+            # 詳細ログを出す
+            print(f"[WARN] add response not success: success_field={succ!r} text_snippet={str(text)[:200]}")
+    except Exception as e:
+        print(f"[OK] {title} (parse error: {e})")
 
 
 def cycle_deque(dq: deque, count: int):

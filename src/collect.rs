@@ -47,7 +47,9 @@ pub enum SearchRes {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IndexReq {
     pub url: String,
+    #[serde(default)]
     pub title: Option<String>,
+    #[serde(default)]
     pub favicon: Option<String>,
     /// タグは空でも良い
     /// 例: ["wiki", "blog"]
@@ -60,8 +62,12 @@ pub struct IndexReq {
     /// - "shopping": ショッピングサイト
     /// - "academic": 学術論文
     /// - "tools": ツール系サイト
+    #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
     pub descriptions: Option<String>,
+    #[serde(default)]
+    pub target_selector: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +80,7 @@ pub enum IndexRes {
         favicon: Option<Box<str>>,
         tags: Vec<Box<str>>,
         descriptions: Box<str>,
+        links: Vec<Box<str>>,
     },
     #[serde(rename = "false")]
     Failed {
@@ -113,16 +120,16 @@ pub struct ScrapeResults {
 
 /// success が bool の API レスポンスに対応 (例: {"success":true, ...} / {"success":false, "error":...})
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "success")]
 pub enum ScraperResult {
+    #[serde(rename = "true")]
     Success {
-        success: bool, // 常に true を想定
         status: u16,
         url: String,
         results: ScrapeResults,
     },
+    #[serde(rename = "false")]
     Failed {
-        success: bool, // 常に false を想定
         error: String,
     },
 }
