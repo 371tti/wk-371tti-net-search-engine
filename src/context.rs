@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use kurosabi::context::ContextMiddleware;
 
-use crate::{index::IndexPool, tokenize::SudachiTokenizer};
+use crate::{engine::IndexPool, tokenize::SudachiTokenizer};
 
 #[derive(Clone)]
 pub struct SearchContext {

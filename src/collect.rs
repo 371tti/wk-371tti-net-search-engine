@@ -3,7 +3,7 @@ use std::{collections::HashMap, ops::Range};
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
 
-use crate::index::IndexMeta;
+use crate::engine::meta::IndexMeta;
 
 pub struct ScoredEntry {
     pub score: f64,

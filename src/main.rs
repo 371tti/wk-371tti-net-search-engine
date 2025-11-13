@@ -2,32 +2,15 @@ mod tokenize;
 mod context;
 mod collect;
 mod http_client;
-mod index;
-
+mod engine;
+mod utils;
+mod handler;
 
 use kurosabi::Kurosabi;
-use log::{debug, info, warn};
+use log::info;
 use tokio::signal;
-use crate::{collect::{IndexReq, IndexRes, MetaReq, MetaRes, ScraperResult, SearchRes}, context::SearchContext, http_client::fetch_scraper_api, index::{IndexMeta, Tags}};
+use crate::{context::SearchContext, handler::{add::AddHandler, del::DelHandler, meta::MetaHandler, search::SearchHandler}};
 use std::sync::atomic::{AtomicBool, Ordering};
-use percent_encoding::percent_decode_str;
-use tf_idf_vectorizer::{SimilarityAlgorithm, TokenFrequency};
-
-// シンプルな URL クエリ値用パーセントエンコーダ（RFC3986 の unreserved を除いて byte を %HH に変換）
-fn percent_encode_query_value(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    out
-}
 
 pub const INDEX_DIR: &str = "./index_data";
 pub const SCRAPER_API_URL: &str = "http://192.168.0.81/scraping?url=";
@@ -37,6 +20,7 @@ pub const MAX_SEARCH_RESULTS: usize = 1000; // 検索結果の最大数
 pub const DEFAULT_SEARCH_RESULTS: usize = 20; // 検索結果のデフォルト数
 
 static CTRL_C_SAVED: AtomicBool = AtomicBool::new(false);
+pub static BLOCK_INDEX_ACCESS: AtomicBool = AtomicBool::new(false);
 
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 32)]
@@ -53,11 +37,17 @@ async fn main() {
             log::error!("Failed to install Ctrl+C handler: {}", e);
             return;
         }
+        info!("Ctrl+C detected, saving index and shutting down...");
+        info!("Blocking index access during shutdown");
+        BLOCK_INDEX_ACCESS.store(true, Ordering::SeqCst);
+        info!("Waiting for ongoing write operations to complete");
+        context_clone.index_pool.wait_for_writing();
+        info!("Ongoing write operations completed");
         if CTRL_C_SAVED
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            log::info!("Ctrl+C detected. Flushing index to disk...");
+            log::info!("Flushing index to disk...");
             context_clone.index_pool.save(INDEX_DIR).await.unwrap_or_else(|e| {
                 log::error!("Index save failed: {}", e);
             });
@@ -87,279 +77,10 @@ async fn main() {
         c
     });
 
-    kurosabi.post("/meta", |mut c| async move {
-        let meta_req = match c.req.body_de_struct::<MetaReq>().await {
-            Ok(v) => v,
-            Err(_) => {
-                warn!("Missing or invalid request body");
-                let result = MetaRes::Failed { error: "Invalid request body".to_string() };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(400);
-                return c;
-            },
-        };
-
-        let url = meta_req.url;
-        let meta = match c.c.index_pool.get_meta(&url).await {
-            Some(m) => m,
-            None => {
-                let result = MetaRes::Failed { error: "Document not found".to_string() };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(404);
-                return c;
-            }
-        };
-
-        let result = MetaRes::Success {
-            meta,
-        };
-        c.res.json_value(&serde_json::to_value(&result).unwrap());
-        c.res.set_status(200);
-        c
-    });
-
-    kurosabi.post("/add", |mut c| async move {
-        let index_req = match c.req.body_de_struct::<IndexReq>().await {
-            Ok(v) => v,
-            Err(_) => {
-                warn!("Missing or invalid request body");
-                let result = IndexRes::Failed { error: "Invalid request body".to_string() };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(400);
-                return c;
-            },
-        };
-
-        // クエリパラメータとフラグメント削除
-        let url = {
-            let s = &index_req.url;
-            // フラグメント削除
-            let no_frag = s.split('#').next().unwrap_or(s);
-
-            no_frag.split("?").next().unwrap_or(no_frag).to_string()
-        };
-
-        println!("Received /add request for URL: {}", url);
-        // url をクエリ値として安全に渡すためエンコード
-        let escaped = percent_encode_query_value(&url);
-        let mut req_url = format!("{}{}", SCRAPER_API_URL, escaped);
-        if let Some(selector) = &index_req.target_selector {
-            // セレクタが指定されている場合は追加でパラメータを付与
-            req_url.push_str("&text_selector=");
-            req_url.push_str(&selector);
-        }
-        println!("Fetching from scraper API: {}", req_url);
-        let scraper_result = match fetch_scraper_api(&req_url).await {
-            Ok(res) => res,
-            Err(e) => {
-                warn!("Failed to fetch scraper API: {}", e);
-                let result = IndexRes::Failed { error: format!("Failed to fetch scraper API: {}", e) };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(500);
-                return c;
-            }
-        };
-        println!("Scraper API response received for URL: {}", url);
-
-        match scraper_result {
-            ScraperResult::Success { results, status,  url: _ } => {
-                if status != 200 {
-                    warn!("Scraper API returned non-200 status: {}", status);
-                    let result = IndexRes::Failed { error: format!("Scraper API returned status: {}", status) };
-                    c.res.json_value(&serde_json::to_value(&result).unwrap());
-                    c.res.set_status(500);
-                    return c;
-                }
-
-                let body = results.text;
-
-                let title = match index_req.title.or_else(|| results.title) {
-                    Some(t) => t,
-                    None => "No Title".to_string(),
-                }.chars().take(MAX_TITLE_LENGTH).collect();
-
-                let description = match index_req.descriptions.clone() {
-                    Some(d) => d.chars().take(MAX_DESC_LENGTH).collect(),
-                    None => body.chars().take(MAX_DESC_LENGTH).collect(), // 先頭500文字を説明に
-                };
-                
-                let favicon: Option<Box<str>> = index_req.favicon.or_else(|| results.favicon ).map(|s| s.into_boxed_str());
-                let url = results.url.into_boxed_str();
-                let tags = Tags::from_strs(&index_req.tags);
-                let lang = results.lang.map(|s| s.clone().into_boxed_str());
-                let links = results.links.into_iter().map(|v| v.into_boxed_str()).collect();
-
-                let (tokens, token_sum) = match c.c.sudachi_tokenizer.mix_doc_tokenizer(&body) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("sudachi_tokenize_large error: {}", e);
-                        let result = IndexRes::Failed { error: format!("Tokenization error: {}", e) };
-                        c.res.json_value(&serde_json::to_value(&result).unwrap());
-                        c.res.set_status(500);
-                        return c;
-                    }
-                };
-
-                let meta = IndexMeta { 
-                    id: 0, 
-                    token_sum,
-                    url, 
-                    title, 
-                    description, 
-                    favicon, 
-                    lang,
-                    time: chrono::Utc::now(), 
-                    points: 0.0, 
-                    tags,
-                    links
-                };
-
-                let token_fq = TokenFrequency::from(&tokens[..]);
-
-                let _is_success = c.c.index_pool.add_document(&token_fq, meta.clone()).await;
-                info!("Added URL: {}", meta.url);
-                let result = IndexRes::Success { 
-                    url: meta.url, 
-                    title: meta.title, 
-                    favicon: meta.favicon, 
-                    tags: meta.tags.tags(), 
-                    descriptions: meta.description, 
-                    links: meta.links.clone(),
-                };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(200);
-                return c;
-            }
-            ScraperResult::Failed { error } => {
-                warn!("Scraper API returned error: {}", error);
-                let result = IndexRes::Failed { error: format!("Scraper API error: {}", error) };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(500);
-                return c;
-            }
-        }
-    });
-
-    kurosabi.get("/del/*", |mut c| async move {
-        // パスパラメータからurlを取得
-        let full_path = &c.req.path.path;
-        let del_part = if let Some(idx) = full_path.find("/del/") {
-            &full_path[idx + 5..]
-        } else {
-            full_path
-        };
-
-        let success = c.c.index_pool.del_document(del_part).await;
-
-        if success {
-            let result = serde_json::json!({
-                "success": true,
-                "url": del_part,
-            });
-            c.res.json_value(&result);
-            c.res.set_status(200);
-        } else {
-            let result = serde_json::json!({
-                "success": false,
-                "error": "Document not found",
-            });
-            c.res.json_value(&result);
-            c.res.set_status(404);
-        }
-        c
-    });
-
-    kurosabi.get("/search", |mut c| async move {
-        // query（URLエンコードされている可能性があるためデコード）
-        let query_str = match c.req.path.get_query("query") {
-            Some(q) => {
-                let decoded = percent_decode_str(&q)
-                    .decode_utf8()
-                    .map(|cow| cow.into_owned())
-                    .unwrap_or(q);
-                let trimmed = decoded.trim().to_string();
-                if trimmed.is_empty() {
-                    let result = SearchRes::Failed { error: "Missing query".to_string() };
-                    c.res.json_value(&serde_json::to_value(&result).unwrap());
-                    c.res.set_status(400);
-                    return c;
-                }
-                trimmed
-            }
-            None => {
-                let result = SearchRes::Failed { error: "Missing query".to_string() };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(400);
-                return c;
-            }
-        };
-        // range パラメータ正規化
-        let (range_start, range_end) = parse_range_param(c.req.path.get_query("range"));
-        let range = range_start..range_end;
-        // algo (URLエンコードの可能性があるためデコードしてから簡易パース)
-        let algo_str_raw = c
-            .req
-            .path
-            .get_query("algo")
-            .unwrap_or_else(|| "BM25(1.2,0.75)".to_string());
-        let algo_str = percent_decode_str(&algo_str_raw)
-            .decode_utf8()
-            .map(|cow| cow.into_owned())
-            .unwrap_or(algo_str_raw);
-        let algo = parse_algo(&algo_str);
-        // tag (URLエンコードの可能性があるためデコードしてからパース)
-        // tag=tag1,tag2,...
-        let tag_str = c.req.path.get_query("tag").unwrap_or_default();
-        let tag_decoded = percent_decode_str(&tag_str)
-            .decode_utf8()
-            .map(|cow| cow.into_owned())
-            .unwrap_or(tag_str.to_string());
-        let tags = Tags::from_strs(&tag_decoded.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect::<Vec<_>>());
-        let tag_exclusive = c.req.path.get_query("tag_exclusive")
-            .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "true" || v == "1"
-            })
-            .unwrap_or(false);
-
-        debug!("tag_exclusive={}", tag_exclusive);
-
-        // tokenize (Sudachi 正規化)
-        let tokens = match c.c.sudachi_tokenizer.mix_query_tokenizer(&query_str) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("sudachi_tokenize_large error: {}", e);
-                let result = SearchRes::Failed { error: format!("Tokenization error: {}", e) };
-                c.res.json_value(&serde_json::to_value(&result).unwrap());
-                c.res.set_status(500);
-                return c;
-            }
-        };
-        if tokens.is_empty() {
-            let result = SearchRes::Success { query: query_str, tokenize_query: tokens, algorithm: algo_str.clone(), range, results: Vec::new() };
-            c.res.json_value(&serde_json::to_value(&result).unwrap());
-            c.res.set_status(200);
-            return c;
-        }
-
-        let tf = TokenFrequency::from(&tokens[..]);
-
-        // IndexPool を使ってスコア計算
-        let scored = c.c.index_pool.per_similarity(&tf, &algo).await;
-        println!("Scored {} documents", scored.len());
-        let sorted = c.c.index_pool.sort_by_score(scored);
-        let results = c.c.index_pool.generate_results(sorted, range.clone(), tags, tag_exclusive).await;
-        let result = SearchRes::Success { 
-            query: query_str, 
-            tokenize_query: tokens, 
-            algorithm: algo_str, 
-            range: range, 
-            results: results 
-        };
-        c.res.json_value(&serde_json::to_value(&result).unwrap());
-        c.res.set_status(200);
-        c
-    });
+    kurosabi.post("/meta", |c| async move { MetaHandler::meta(c).await });
+    kurosabi.post("/add", |c| async move { AddHandler::add(c).await });
+    kurosabi.get("/del/*", |c| async move { DelHandler::del(c).await });
+    kurosabi.get("/search", |c| async move { SearchHandler::search(c).await });
 
     kurosabi.not_found_handler(|mut c| async move {
         c.res.text("Not Found");
@@ -377,87 +98,6 @@ async fn main() {
         .run_async()
         .await;
 }
-
-// 検索アルゴリズムの簡易パーサ
-fn parse_algo(s: &str) -> SimilarityAlgorithm {
-    let lower = s.trim().to_ascii_lowercase();
-    // 補助: 引数の括弧内から数値を抽出
-    fn nums(src: &str) -> Vec<f64> {
-        if let (Some(l), Some(r)) = (src.find('('), src.rfind(')')) {
-            let inner = &src[l + 1..r];
-            inner
-                .split(',')
-                .filter_map(|p| p.trim().parse::<f64>().ok())
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    if lower.starts_with("dot") {
-        SimilarityAlgorithm::Dot
-    } else if lower.starts_with("cosine") || lower.starts_with("cosinesimilarity") {
-        SimilarityAlgorithm::CosineSimilarity
-    } else if lower.starts_with("bm25") {
-        // BM25(k1, b) の形式を受け取る。引数が省略された場合は既定値を使う。
-        let vals = nums(&lower);
-        let k1 = vals.get(0).copied().unwrap_or(1.2);
-        let b = vals.get(1).copied().unwrap_or(0.75);
-        SimilarityAlgorithm::BM25(k1, b)
-    } else {
-        // 既定
-        SimilarityAlgorithm::BM25(1.2, 0.75)
-    }
-}
-
-// range クエリ文字列を正規化して (start, end) (endは排他的) を返す
-// 受け入れる形式:
-//   "a..b"  -> a..b
-//   "..b"   -> 0..b
-//   "a.."   -> a..a+DEFAULT_SEARCH_RESULTS
-//   "v"     -> v..v+DEFAULT_SEARCH_RESULTS
-//   空/None  -> 0..DEFAULT_SEARCH_RESULTS
-// 正規化:
-//   1) 解析失敗はデフォルト
-//   2) end < start の場合 swap (例: 20..10 -> 10..20)
-//   3) 幅 > MAX_SEARCH_RESULTS の場合 end = start + MAX_SEARCH_RESULTS
-//   4) 加算は saturating_add でオーバーフロー防止
-fn parse_range_param(raw: Option<String>) -> (usize, usize) {
-    let default_end = DEFAULT_SEARCH_RESULTS.min(MAX_SEARCH_RESULTS);
-    let Some(s) = raw else { return (0, default_end); };
-    if s.is_empty() { return (0, default_end); }
-
-    let (mut start, mut end) = if let Some((l, r)) = s.split_once("..") {
-        // a..b / a.. / ..b
-        let start = if l.is_empty() { 0 } else { l.parse::<usize>().unwrap_or(0) };
-        if r.is_empty() {
-            // a..  -> a..a+DEFAULT
-            let tentative = start.saturating_add(DEFAULT_SEARCH_RESULTS);
-            (start, tentative)
-        } else {
-            // a..b / ..b
-            let end = r.parse::<usize>().unwrap_or(start);
-            let start = if l.is_empty() { 0 } else { start }; // ..b の場合 start=0
-            (start, end)
-        }
-    } else {
-        // 単値 v
-        let v = s.parse::<usize>().unwrap_or(0);
-        let end = v.saturating_add(DEFAULT_SEARCH_RESULTS);
-        (v, end)
-    };
-
-    // swap if reversed
-    if end < start { std::mem::swap(&mut start, &mut end); }
-
-    // 幅制限
-    let max_end = start.saturating_add(MAX_SEARCH_RESULTS);
-    if end > max_end { end = max_end; }
-
-    (start, end)
-}
-
-
 
 
 
