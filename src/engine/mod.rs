@@ -81,110 +81,87 @@ impl IndexPool {
 
         let url = meta.url.clone();
 
-        let mut is_new = true;
-        let mut shard_id = 0;
-        let mut doc_id = 0;
-        // 既存で登録されているかチェック
-        // 最小サイズシャード選択用 (初期は最大値)
-        let mut best_size: u64 = u64::MAX;
-        for index in &self.indexes {
-            match index.try_read() {
-                Ok(idx) => {
-                    if is_new {
-                        if let Some(m) = idx.meta_from_url(&url) {
-                            shard_id = idx.id;
-                            doc_id = m.id;
-                            is_new = false;
-                            break;
-                        }
-                    }
-                    // 未登録なら最もサイズの小さいシャードへ
-                    let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
-                    if size <= best_size {
-                        best_size = size;
-                        shard_id = idx.id;
-                    }
-                }
-                Err(_e) => {
-                    warn!("RwLock locked or unavailable, skipping");
-                    continue;
-                }
+        let do_flags = match self.url_to_entry_hint(&url) {
+            EntryHintResult::Error => {
+                return None;
+            },
+            EntryHintResult::New(shard_id) => {
+                // 新規登録
+                let mut idx = match self.indexes[shard_id].write() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        error!("RwLock poisoned: {}", e);
+                        return None;
+                    },
+                };
+                let doc_id = idx.generate_next_id();
+                idx.vectorizer.add_doc(doc_id, token_fq);
+                // token_sumを強引に調整(複数のtokenizerを通している場合に合わなくなるため これでc_tokensについては正確になる)
+                idx.vectorizer.documents.get_mut(doc_id).map(|d| {
+                    d.token_sum = meta.token_sum;
+                });
+                idx.vectorizer.update_idf();
+                meta.id = doc_id;
+                meta.links.iter_mut().for_each(|link| {
+                    let s: &str = link.as_ref();
+                    let no_frag = s.split('#').next().unwrap_or(s);
+                    let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+                    *link = no_query.to_string().into();
+                });
+                meta.links.sort_unstable();
+                meta.links.dedup();
+                idx.vectorizer.update_idf();
+                idx.meta.push(meta);
+                let do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
+                let do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
+                idx.update_count += 1;
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                (do_save, do_calculate_size, shard_id, true)
+            },
+            EntryHintResult::Existing(shard_id, doc_id) => {
+                // 既存を削除してから再登録
+                let mut idx = match self.indexes[shard_id].write() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        error!("RwLock poisoned: {}", e);
+                        return None;
+                    },
+                };
+                idx.vectorizer.del_doc(&doc_id);
+                idx.vectorizer.add_doc(doc_id, token_fq);
+                // token_sumを強引に調整(複数のtokenizerを通している場合に合わなくなるため これでc_tokensについては正確になる)
+                idx.vectorizer.documents.get_mut(doc_id).map(|d| {
+                    d.token_sum = meta.token_sum;
+                });
+                meta.links.iter_mut().for_each(|link| {
+                    let s: &str = link.as_ref();
+                    let no_frag = s.split('#').next().unwrap_or(s);
+                    let no_query = no_frag.split('?').next().unwrap_or(no_frag);
+                    *link = no_query.to_string().into();
+                });
+                meta.links.sort_unstable();
+                meta.links.dedup();
+                idx.vectorizer.update_idf();
+                idx.meta_from_id_mut(doc_id).map(|m| {
+                    m.url = meta.url.clone();
+                    m.title = meta.title.clone();
+                    m.favicon = meta.favicon.clone();
+                    m.tags = meta.tags.clone();
+                    m.description = meta.description.clone();
+                    m.points = meta.points;
+                    m.time = meta.time;
+                    m.lang = meta.lang.clone();
+                    m.links = meta.links.clone();
+                    m.token_sum = meta.token_sum;
+                });
+                let do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
+                let do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
+                idx.update_count += 1;
+                (do_save, do_calculate_size, shard_id, false)
             }
-        }
-        let do_save;
-        let do_calculate_size ;
-        if is_new {
-            // 新規登録
-            let mut idx = match self.indexes[shard_id].write() {
-                Ok(i) => i,
-                Err(e) => {
-                    error!("RwLock poisoned: {}", e);
-                    return None;
-                },
-            };
-            doc_id = idx.generate_next_id();
-            idx.vectorizer.add_doc(doc_id, token_fq);
-            // token_sumを強引に調整(複数のtokenizerを通している場合に合わなくなるため これでc_tokensについては正確になる)
-            idx.vectorizer.documents.get_mut(doc_id).map(|d| {
-                d.token_sum = meta.token_sum;
-            });
-            idx.vectorizer.update_idf();
-            meta.id = doc_id;
-            meta.links.iter_mut().for_each(|link| {
-                let s: &str = link.as_ref();
-                let no_frag = s.split('#').next().unwrap_or(s);
-                let no_query = no_frag.split('?').next().unwrap_or(no_frag);
-                *link = no_query.to_string().into();
-            });
-            meta.links.sort_unstable();
-            meta.links.dedup();
-            idx.vectorizer.update_idf();
-            idx.meta.push(meta);
-            do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
-            do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
-            idx.update_count += 1;
-            self.counter.fetch_add(1, Ordering::SeqCst);
-        } else {
-            // 既存を削除してから再登録
-            let mut idx = match self.indexes[shard_id].write() {
-                Ok(i) => i,
-                Err(e) => {
-                    error!("RwLock poisoned: {}", e);
-                    return None;
-                },
-            };
-            idx.vectorizer.del_doc(&doc_id);
-            idx.vectorizer.add_doc(doc_id, token_fq);
-            // token_sumを強引に調整(複数のtokenizerを通している場合に合わなくなるため これでc_tokensについては正確になる)
-            idx.vectorizer.documents.get_mut(doc_id).map(|d| {
-                d.token_sum = meta.token_sum;
-            });
-            meta.links.iter_mut().for_each(|link| {
-                let s: &str = link.as_ref();
-                let no_frag = s.split('#').next().unwrap_or(s);
-                let no_query = no_frag.split('?').next().unwrap_or(no_frag);
-                *link = no_query.to_string().into();
-            });
-            meta.links.sort_unstable();
-            meta.links.dedup();
-            idx.vectorizer.update_idf();
-            idx.meta_from_id_mut(doc_id).map(|m| {
-                m.url = meta.url.clone();
-                m.title = meta.title.clone();
-                m.favicon = meta.favicon.clone();
-                m.tags = meta.tags.clone();
-                m.description = meta.description.clone();
-                m.points = meta.points;
-                m.time = meta.time;
-                m.lang = meta.lang.clone();
-                m.links = meta.links.clone();
-                m.token_sum = meta.token_sum;
-            });
-            do_save = idx.update_count % SAVE_FILE_INTERVAL == 0;
-            do_calculate_size = idx.update_count % CALCULATE_BIN_SIZE_INTERVAL == 0;
-            idx.update_count += 1;
-        }
+        };
 
+        let (do_save, do_calculate_size, shard_id, is_new) = do_flags;
         if do_save {
             // Save the index to disk
             if let Ok(bin_size) = self.save_shard(shard_id, &self.index_dir).await {
@@ -285,6 +262,74 @@ impl IndexPool {
             };
         }
     }
+
+    pub fn url_to_entry_hint(&self, url: &str) -> EntryHintResult {
+        let mut is_new = true;
+        let mut shard_id = 0;
+        let mut doc_id = 0;
+        // 既存で登録されているかチェック
+        // 最小サイズシャード選択用 (初期は最大値)
+        let mut best_size: u64 = u64::MAX;
+        for index in &self.indexes {
+            match index.read() {
+                Ok(idx) => {
+                    if is_new {
+                        if let Some(m) = idx.meta_from_url(&url) {
+                            shard_id = idx.id;
+                            doc_id = m.id;
+                            is_new = false;
+                            break;
+                        }
+                    }
+                    // 未登録なら最もサイズの小さいシャードへ
+                    let size = idx.meta_bin_size.max(idx.vectorizer_bin_size);
+                    if size <= best_size {
+                        best_size = size;
+                        shard_id = idx.id;
+                    }
+                }
+                Err(_e) => {
+                    error!("RwLock poisoned: {}", _e);
+                    return EntryHintResult::Error;
+                }
+            }
+        }
+        if is_new {
+            EntryHintResult::New(shard_id)
+        } else {
+            EntryHintResult::Existing(shard_id, doc_id)
+        }
+    }
+
+    pub fn url_to_token_freq(&self, url: &str) -> Option<TokenFrequency> {
+        for index in &self.indexes {
+            let guard = match index.try_read() {
+                Ok(g) => g,
+                Err(e) => match e {
+                    TryLockError::WouldBlock => {
+                        warn!("RwLock would block, skipping");
+                        continue;
+                    }
+                    TryLockError::Poisoned(e) => {
+                        error!("RwLock poisoned: {}", e);
+                        continue;
+                    }
+                },
+            };
+            if let Some(meta) = guard.meta_from_url(url) {
+                if let Some(tf) = guard.vectorizer.get_tf_into_token_freq(&meta.id) {
+                    return Some(tf.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+pub enum EntryHintResult {
+    New(usize),          // shard_id
+    Existing(usize, usize), // shard_id, doc_id
+    Error,
 }
 
 

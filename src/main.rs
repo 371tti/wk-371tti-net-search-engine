@@ -78,6 +78,7 @@ async fn main() {
     });
 
     kurosabi.post("/meta", |c| async move { MetaHandler::meta(c).await });
+    kurosabi.post("/token_freq", |c| async move { MetaHandler::token_freq(c).await });
     kurosabi.post("/add", |c| async move { AddHandler::add(c).await });
     kurosabi.get("/del/*", |c| async move { DelHandler::del(c).await });
     kurosabi.get("/search", |c| async move { SearchHandler::search(c).await });

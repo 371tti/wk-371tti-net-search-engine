@@ -2,6 +2,7 @@ use std::{collections::HashMap, ops::Range};
 
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
+use tf_idf_vectorizer::TokenFrequency;
 
 use crate::engine::meta::IndexMeta;
 
@@ -105,6 +106,26 @@ pub enum MetaRes {
         error: String,
     },
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenFreqReq {
+    pub url: String,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "success")]
+pub enum TokenFreqRes {
+    #[serde(rename = "true")]
+    Success {
+        fq: TokenFrequency,
+    },
+    #[serde(rename = "false")]
+    Failed {
+        error: String,
+    },
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScrapeResults {
