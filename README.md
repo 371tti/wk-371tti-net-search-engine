@@ -17,10 +17,17 @@ Rust 製のシンプルな TF-IDF / BM25 系検索エンジン API サーバ。
 cargo build --release
 cargo run --release
 ```
-Windows PowerShell 例:
-```pwsh
-cargo run --release
-```
+
+sudachiを使用して日本語のtokenizeをするため、 /config/ に以下のファイルが必要です。
+- sudachi.json
+- system.dic
+- char.def
+- rewrite.def
+- unk.def
+
+これらについては
+[sudachi-rs](https://github.com/sorami/sudachi.rs)
+を参照してください。
 
 ## 環境変数
 | 変数 | 説明 | 例 |
