@@ -1,5 +1,9 @@
 # wk-371tti-net-search-engine
 
+> [!WARNING]
+> 完全に個人的、実験的であり、保守する予定がありません。  
+> 興味のある場合、[tf-idf-vectorizer](https://github.com/371tti/tf-idf-vectorizer)をご覧ください。  
+
 Rust 製のシンプルな TF-IDF / BM25 系検索エンジン API サーバ。
 外部スクレイパ API からメタ情報を取得しインデックス化、HTTP 経由で検索を提供します。
 
